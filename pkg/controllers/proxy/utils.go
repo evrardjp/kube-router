@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"hash/fnv"
 	"net"
-	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/v2/internal/nlretry"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/cri"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 	"github.com/vishvananda/netlink"
@@ -29,6 +29,16 @@ const (
 	sysFSVirtualNetPath    = "/sys/devices/virtual/net"
 	sysFSHairpinRelPath    = "brport/hairpin_mode"
 	hairpinEnable          = "1"
+)
+
+var (
+	// errNoServicePodForEndpoint is returned when an endpoint IP doesn't belong to a non-hostNetwork pod in the
+	// service's namespace
+	errNoServicePodForEndpoint = errors.New("no non-hostNetwork pod found for endpoint in service namespace")
+
+	// errEndpointPodUnavailable is returned when the endpoint's pod exists but can't be entered from this node, either
+	// because it runs on another node or because it doesn't have a container yet
+	errEndpointPodUnavailable = errors.New("endpoint pod is not available on this node")
 )
 
 func attemptNamespaceResetAfterError(hostNSHandle netns.NsHandle) {
@@ -62,7 +72,7 @@ func (nsc *NetworkServicesController) generateUniqueFWMark(ip, protocol, port st
 		if increment == 0 {
 			_, err = h.Write([]byte(ip + "-" + protocol + "-" + port))
 		} else {
-			_, err = h.Write([]byte(ip + "-" + protocol + "-" + port + "-" + fmt.Sprintf("%d", increment)))
+			_, err = h.Write([]byte(ip + "-" + protocol + "-" + port + "-" + strconv.Itoa(increment)))
 		}
 		if err != nil {
 			return 0, err
@@ -109,17 +119,58 @@ func (nsc *NetworkServicesController) lookupFWMarkByService(ip, protocol, port s
 func (nsc *NetworkServicesController) lookupServiceByFWMark(fwMark uint32) (string, string, int, error) {
 	serviceKey, ok := nsc.fwMarkMap[fwMark]
 	if !ok {
-		return "", "", 0, fmt.Errorf("could not find service matching the given FW mark")
+		return "", "", 0, errors.New("could not find service matching the given FW mark")
 	}
 	serviceKeySplit := strings.Split(serviceKey, "-")
 	if len(serviceKeySplit) != 3 {
-		return "", "", 0, fmt.Errorf("service key for found FW mark did not have 3 parts, this shouldn't be possible")
+		return "", "", 0, errors.New("service key for found FW mark did not have 3 parts, this shouldn't be possible")
 	}
 	port, err := strconv.ParseInt(serviceKeySplit[2], 10, 32)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("port number for service key for found FW mark was not a 32-bit int: %v", err)
+		return "", "", 0, fmt.Errorf("port number for service key for found FW mark was not a 32-bit int: %w", err)
 	}
 	return serviceKeySplit[0], serviceKeySplit[1], int(port), nil
+}
+
+// isValidKubeRouterServiceArtifact looks up a service by its clusterIP, externalIP, or loadBalancerIP. It returns
+// truthy. localIPs is the node's local address map, supplied by the caller.
+func (nsc *NetworkServicesController) isValidKubeRouterServiceArtifact(address net.IP, nodePort int,
+	localIPs map[v1.IPFamily][]net.IP) (bool, error) {
+	for _, svc := range nsc.getServiceMap() {
+		for _, clIP := range svc.clusterIPs {
+			if net.ParseIP(clIP).Equal(address) {
+				return true, nil
+			}
+		}
+		for _, exIP := range svc.externalIPs {
+			if net.ParseIP(exIP).Equal(address) {
+				return true, nil
+			}
+		}
+		for _, lbIP := range svc.loadBalancerIPs {
+			if net.ParseIP(lbIP).Equal(address) {
+				return true, nil
+			}
+		}
+		if nodePort != 0 && svc.nodePort == nodePort {
+			if nsc.nodeportBindOnAllIP {
+				var addresses []net.IP
+				if address.To4() != nil {
+					addresses = localIPs[v1.IPv4Protocol]
+				} else {
+					addresses = localIPs[v1.IPv6Protocol]
+				}
+				for _, addr := range addresses {
+					if addr.Equal(address) {
+						return true, nil
+					}
+				}
+			} else if address.Equal(nsc.krNode.GetPrimaryNodeIP()) {
+				return true, nil
+			}
+		}
+	}
+	return false, fmt.Errorf("service not found for address %s", address.String())
 }
 
 // unsortedListsEquivalent compares two lists of endpointsInfo and considers them the same if they contains the same
@@ -129,7 +180,7 @@ func unsortedListsEquivalent(a, b []endpointSliceInfo) bool {
 		return false
 	}
 
-	values := make(map[interface{}]int)
+	values := make(map[any]int)
 	for _, val := range a {
 		values[val] = 1
 	}
@@ -169,13 +220,15 @@ func endpointsMapsEquivalent(a, b endpointSliceInfoMap) bool {
 
 // convertSvcProtoToSysCallProto converts a string based protocol that we receive from Kubernetes via something like the
 // serviceInfo object into the uint16 syscall version of the protocol that is capable of interfacing with aspects of the
-// Linux sub-sysem like IPVS
+// Linux sub-system like IPVS
 func convertSvcProtoToSysCallProto(svcProtocol string) uint16 {
 	switch svcProtocol {
 	case tcpProtocol:
 		return syscall.IPPROTO_TCP
 	case udpProtocol:
 		return syscall.IPPROTO_UDP
+	case sctpProtocol:
+		return syscall.IPPROTO_SCTP
 	default:
 		return syscall.IPPROTO_NONE
 	}
@@ -189,27 +242,36 @@ func convertSysCallProtoToSvcProto(sysProtocol uint16) string {
 		return tcpProtocol
 	case syscall.IPPROTO_UDP:
 		return udpProtocol
+	case syscall.IPPROTO_SCTP:
+		return sctpProtocol
 	default:
 		return noneProtocol
 	}
 }
 
 // findContainerRuntimeReferences find the container runtime and container ID for a given endpoint IP do this by:
-//   - Resolving the endpoint IP to a pod
+//   - Resolving the endpoint IP to a non-hostNetwork pod in the given namespace
 //   - Ensure that the pod actually exists on the node in question
 //   - Get the container ID of the primary container (since this function primarily allows us to enter the pod's
 //     namespace, it doesn't really matter which container we choose here, if this function gets used for something
 //     else in the future, this might have to be re-evaluated)
-func (nsc *NetworkServicesController) findContainerRuntimeReferences(endpointIP string) (string, string, error) {
-	podObj, err := nsc.getPodObjectForEndpointIP(endpointIP)
+func (nsc *NetworkServicesController) findContainerRuntimeReferences(namespace, endpointIP string) (string, string,
+	error) {
+	podObj, err := nsc.getNamespacedPodObjectForEndpointIP(namespace, endpointIP)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to find endpoint with ip: %s. so skipping preparing endpoint for DSR",
-			endpointIP)
+		return "", "", fmt.Errorf("failed to find endpoint with ip: %s. so skipping preparing endpoint for DSR: %w",
+			endpointIP, err)
 	}
 
 	// we are only concerned with endpoint pod running on current node
-	if strings.Compare(podObj.Status.HostIP, nsc.primaryIP.String()) != 0 {
-		return "", "", nil
+	if strings.Compare(podObj.Status.HostIP, nsc.krNode.GetPrimaryNodeIP().String()) != 0 {
+		return "", "", fmt.Errorf("%w: pod %s/%s for endpoint %s is on host %s", errEndpointPodUnavailable,
+			podObj.Namespace, podObj.Name, endpointIP, podObj.Status.HostIP)
+	}
+
+	if len(podObj.Status.ContainerStatuses) == 0 {
+		return "", "", fmt.Errorf("%w: pod %s/%s for endpoint %s has no container statuses yet",
+			errEndpointPodUnavailable, podObj.Namespace, podObj.Name, endpointIP)
 	}
 
 	containerURL := podObj.Status.ContainerStatuses[0].ContainerID
@@ -230,8 +292,8 @@ func (nsc *NetworkServicesController) findContainerRuntimeReferences(endpointIP 
 // addDSRIPInsidePodNetNamespace takes a given external IP and endpoint IP for a DSR service and then uses the container
 // runtime to add the external IP to a virtual interface inside the pod so that it can receive DSR traffic inside its
 // network namespace.
-func (nsc *NetworkServicesController) addDSRIPInsidePodNetNamespace(externalIP, endpointIP string) error {
-	crRuntime, containerID, err := nsc.findContainerRuntimeReferences(endpointIP)
+func (nsc *NetworkServicesController) addDSRIPInsidePodNetNamespace(namespace, externalIP, endpointIP string) error {
+	crRuntime, containerID, err := nsc.findContainerRuntimeReferences(namespace, endpointIP)
 	if err != nil {
 		return err
 	}
@@ -241,7 +303,7 @@ func (nsc *NetworkServicesController) addDSRIPInsidePodNetNamespace(externalIP, 
 
 	hostNetworkNamespaceHandle, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("failed to get namespace due to %v", err)
+		return fmt.Errorf("failed to get namespace due to %w", err)
 	}
 	defer utils.CloseCloserDisregardError(&hostNetworkNamespaceHandle)
 
@@ -258,7 +320,7 @@ func (nsc *NetworkServicesController) addDSRIPInsidePodNetNamespace(externalIP, 
 		// ugly workaround, refactoring of pkg/Proxy is required
 		pid, err = nsc.ln.getContainerPidWithCRI(nsc.dsr.runtimeEndpoint, containerID)
 		if err != nil {
-			return fmt.Errorf("failed to prepare endpoint %s to do DSR due to: %v", endpointIP, err)
+			return fmt.Errorf("failed to prepare endpoint %s to do DSR due to: %w", endpointIP, err)
 		}
 	}
 
@@ -274,11 +336,11 @@ func (nsc *NetworkServicesController) getPrimaryAndCIDRsByFamily(ipFamily v1.IPF
 	switch ipFamily {
 	case v1.IPv4Protocol:
 		// If we're not detected to be IPv4 capable break early
-		if !nsc.isIPv4Capable {
+		if !nsc.krNode.IsIPv4Capable() {
 			return "", nil
 		}
 
-		primaryIP = utils.FindBestIPv4NodeAddress(nsc.primaryIP, nsc.nodeIPv4Addrs).String()
+		primaryIP = nsc.krNode.FindBestIPv4NodeAddress().String()
 		if len(nsc.podCidr) > 0 && netutils.IsIPv4CIDRString(nsc.podCidr) {
 			cidrMap[nsc.podCidr] = true
 		}
@@ -291,11 +353,11 @@ func (nsc *NetworkServicesController) getPrimaryAndCIDRsByFamily(ipFamily v1.IPF
 		}
 	case v1.IPv6Protocol:
 		// If we're not detected to be IPv6 capable break early
-		if !nsc.isIPv6Capable {
+		if !nsc.krNode.IsIPv6Capable() {
 			return "", nil
 		}
 
-		primaryIP = utils.FindBestIPv6NodeAddress(nsc.primaryIP, nsc.nodeIPv6Addrs).String()
+		primaryIP = nsc.krNode.FindBestIPv6NodeAddress().String()
 		if len(nsc.podCidr) > 0 && netutils.IsIPv6CIDRString(nsc.podCidr) {
 			cidrMap[nsc.podCidr] = true
 		}
@@ -328,6 +390,24 @@ func (nsc *NetworkServicesController) getPodObjectForEndpointIP(endpointIP strin
 		}
 	}
 	return nil, errors.New("Failed to find pod with ip " + endpointIP)
+}
+
+// getNamespacedPodObjectForEndpointIP resolves an endpoint IP to a pod in the given namespace. EndpointSlice addresses
+// can point at any IP, so pods in other namespaces and hostNetwork pods (which share the node's IP) are never matched.
+func (nsc *NetworkServicesController) getNamespacedPodObjectForEndpointIP(namespace, endpointIP string) (*v1.Pod,
+	error) {
+	for _, obj := range nsc.podLister.List() {
+		pod := obj.(*v1.Pod)
+		if pod.Namespace != namespace || pod.Spec.HostNetwork {
+			continue
+		}
+		for _, ip := range pod.Status.PodIPs {
+			if strings.Compare(ip.IP, endpointIP) == 0 {
+				return pod, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("%w: ip %s, namespace %s", errNoServicePodForEndpoint, endpointIP, namespace)
 }
 
 func (nsc *NetworkServicesController) getServiceForServiceInfo(svcIn *serviceInfo) (*v1.Service, error) {
@@ -454,7 +534,7 @@ func hairpinRuleFrom(serviceIPs []net.IP, endpointIP string, endpointFamily v1.I
 	}
 
 	for _, svcIP := range serviceIPs {
-		ruleArgs := []string{"-s", endpointIP + "/32", "-d", endpointIP + vipSubnet,
+		ruleArgs := []string{"-s", endpointIP + vipSubnet, "-d", endpointIP + vipSubnet,
 			"-m", "ipvs", "--vaddr", svcIP.String(), "--vport", strconv.Itoa(servicePort),
 			"-j", "SNAT", "--to-source", svcIP.String()}
 
@@ -473,7 +553,7 @@ func ensureHairpinChain(iptablesCmdHandler utils.IPTablesHandler) error {
 	hasHairpinChain := false
 	chains, err := iptablesCmdHandler.ListChains("nat")
 	if err != nil {
-		return fmt.Errorf("failed to list iptables chains: %v", err)
+		return fmt.Errorf("failed to list iptables chains: %w", err)
 	}
 	for _, chain := range chains {
 		if chain == ipvsHairpinChainName {
@@ -485,7 +565,7 @@ func ensureHairpinChain(iptablesCmdHandler utils.IPTablesHandler) error {
 	if !hasHairpinChain {
 		err = iptablesCmdHandler.NewChain("nat", ipvsHairpinChainName)
 		if err != nil {
-			return fmt.Errorf("failed to create iptables chain \"%s\": %v", ipvsHairpinChainName, err)
+			return fmt.Errorf("failed to create iptables chain \"%s\": %w", ipvsHairpinChainName, err)
 		}
 	}
 
@@ -493,7 +573,7 @@ func ensureHairpinChain(iptablesCmdHandler utils.IPTablesHandler) error {
 	jumpArgs := []string{"-m", "ipvs", "--vdir", "ORIGINAL", "-j", ipvsHairpinChainName}
 	err = iptablesCmdHandler.AppendUnique("nat", "POSTROUTING", jumpArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to add hairpin iptables jump rule: %v", err)
+		return fmt.Errorf("failed to add hairpin iptables jump rule: %w", err)
 	}
 
 	return nil
@@ -505,9 +585,9 @@ func getAllLocalIPs() (map[v1.IPFamily][]net.IP, error) {
 	// We use maps here so that we can de-duplicate repeat IP addresses
 	v4Map := make(map[string]bool)
 	v6Map := make(map[string]bool)
-	links, err := netlink.LinkList()
+	links, err := nlretry.LinkList(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("could not load list of net interfaces: %v", err)
+		return nil, fmt.Errorf("could not load list of net interfaces: %w", err)
 	}
 
 	for _, link := range links {
@@ -519,9 +599,9 @@ func getAllLocalIPs() (map[v1.IPFamily][]net.IP, error) {
 			continue
 		}
 
-		linkAddrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+		linkAddrs, err := nlretry.AddrList(context.Background(), link, netlink.FAMILY_ALL)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get IPs for interface: %v", err)
+			return nil, fmt.Errorf("failed to get IPs for interface: %w", err)
 		}
 
 		for _, addr := range linkAddrs {
@@ -536,6 +616,16 @@ func getAllLocalIPs() (map[v1.IPFamily][]net.IP, error) {
 	return convertIPMapsToFamilyMap(v4Map, v6Map), nil
 }
 
+// hasAnyIPs reports whether a family separated IP map holds at least one address in any family
+func hasAnyIPs(ipMap map[v1.IPFamily][]net.IP) bool {
+	for _, ips := range ipMap {
+		if len(ips) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // getIPSetName formulates an IP Family specific ipset name based upon the prefix and IPFamily passed
 func getIPSetName(nameBase string, family v1.IPFamily) string {
 	var sb strings.Builder
@@ -548,7 +638,7 @@ func getIPSetName(nameBase string, family v1.IPFamily) string {
 	return sb.String()
 }
 
-// getIPVSFirewallInputChainRule creates IPVS firwall input chain rule based upon the family that is passed. This is
+// getIPVSFirewallInputChainRule creates IPVS firewall input chain rule based upon the family that is passed. This is
 // used by the NSC to ensure that traffic destined for IPVS services on the INPUT table will be directed to the IPVS
 // firewall chain
 func getIPVSFirewallInputChainRule(family v1.IPFamily) []string {
@@ -557,14 +647,6 @@ func getIPVSFirewallInputChainRule(family v1.IPFamily) []string {
 		"-m", "comment", "--comment", "handle traffic to IPVS service IPs in custom chain",
 		"-m", "set", "--match-set", getIPSetName(serviceIPsIPSetName, family), "dst",
 		"-j", ipvsFirewallChainName}
-}
-
-// runIPCommandsWithArgs extend the exec.Command interface to allow passing an additional array of arguments to ip
-func runIPCommandsWithArgs(ipArgs []string, additionalArgs ...string) *exec.Cmd {
-	var allArgs []string
-	allArgs = append(allArgs, ipArgs...)
-	allArgs = append(allArgs, additionalArgs...)
-	return exec.Command("ip", allArgs...)
 }
 
 // getLabelFromMap checks the list of passed labels for the service.kubernetes.io/service-proxy-name
@@ -576,5 +658,5 @@ func getLabelFromMap(label string, labels map[string]string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("label doesn't exist in map")
+	return "", errors.New("label doesn't exist in map")
 }

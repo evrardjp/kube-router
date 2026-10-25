@@ -21,8 +21,14 @@ import (
 // the hairpin controller, and so that it is around to reference in the future if needed, I'm leaving the code
 // for now.
 
+// hairpinEndpoint identifies a local endpoint of a service by the service's namespace and the endpoint IP
+type hairpinEndpoint struct {
+	namespace string
+	ip        string
+}
+
 type hairpinController struct {
-	epC <-chan string
+	epC <-chan hairpinEndpoint
 	nsc *NetworkServicesController
 }
 
@@ -45,23 +51,23 @@ func (hpc *hairpinController) Run(stopCh <-chan struct{}, wg *sync.WaitGroup,
 		case <-stopCh:
 			klog.Info("Shutting down Hairpin Controller goroutine")
 			return
-		case endpointIP := <-hpc.epC:
-			klog.V(1).Infof("Received request for hairpin setup of endpoint %s, processing", endpointIP)
-			err := hpc.ensureHairpinEnabledForPodInterface(endpointIP)
+		case endpoint := <-hpc.epC:
+			klog.V(1).Infof("Received request for hairpin setup of endpoint %s, processing", endpoint.ip)
+			err := hpc.ensureHairpinEnabledForPodInterface(endpoint.namespace, endpoint.ip)
 			if err != nil {
 				klog.Errorf("unable to set hairpin mode for endpoint %s, its possible that hairpinning will not "+
 					"work as expected. Error was: %v",
-					endpointIP, err)
+					endpoint.ip, err)
 			}
 		case <-t.C:
-			healthcheck.SendHeartBeat(healthChan, "HPC")
+			healthcheck.SendHeartBeat(healthChan, healthcheck.HairpinController)
 		}
 	}
 }
 
-func (hpc *hairpinController) ensureHairpinEnabledForPodInterface(endpointIP string) error {
+func (hpc *hairpinController) ensureHairpinEnabledForPodInterface(namespace, endpointIP string) error {
 	klog.V(2).Infof("Attempting to enable hairpin mode for endpoint IP %s", endpointIP)
-	crRuntime, containerID, err := hpc.nsc.findContainerRuntimeReferences(endpointIP)
+	crRuntime, containerID, err := hpc.nsc.findContainerRuntimeReferences(namespace, endpointIP)
 	if err != nil {
 		return err
 	}
@@ -72,7 +78,7 @@ func (hpc *hairpinController) ensureHairpinEnabledForPodInterface(endpointIP str
 
 	hostNetworkNSHandle, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("failed to get namespace due to %v", err)
+		return fmt.Errorf("failed to get namespace due to %w", err)
 	}
 	defer utils.CloseCloserDisregardError(&hostNetworkNSHandle)
 
@@ -81,14 +87,14 @@ func (hpc *hairpinController) ensureHairpinEnabledForPodInterface(endpointIP str
 		// WARN: This method is deprecated and will be removed once docker-shim is removed from kubelet.
 		pid, err = hpc.nsc.ln.getContainerPidWithDocker(containerID)
 		if err != nil {
-			return fmt.Errorf("failed to get pod's (%s) pid for hairpinning due to %v", endpointIP, err)
+			return fmt.Errorf("failed to get pod's (%s) pid for hairpinning due to %w", endpointIP, err)
 		}
 	} else {
 		// We expect CRI compliant runtimes here
 		// ugly workaround, refactoring of pkg/Proxy is required
 		pid, err = hpc.nsc.ln.getContainerPidWithCRI(hpc.nsc.dsr.runtimeEndpoint, containerID)
 		if err != nil {
-			return fmt.Errorf("failed to get pod's (%s) pid for hairpinning due to %v", endpointIP, err)
+			return fmt.Errorf("failed to get pod's (%s) pid for hairpinning due to %w", endpointIP, err)
 		}
 	}
 	klog.V(2).Infof("Found PID %d for endpoint IP %s", pid, endpointIP)
@@ -116,7 +122,7 @@ func (hpc *hairpinController) ensureHairpinEnabledForPodInterface(endpointIP str
 	return os.WriteFile(hpPath, []byte(hairpinEnable), 0644)
 }
 
-func NewHairpinController(nsc *NetworkServicesController, endpointCh <-chan string) *hairpinController {
+func NewHairpinController(nsc *NetworkServicesController, endpointCh <-chan hairpinEndpoint) *hairpinController {
 	hpc := hairpinController{
 		nsc: nsc,
 		epC: endpointCh,

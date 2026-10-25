@@ -12,6 +12,14 @@ First check if you are upgrading across one of the
 [breaking change versions](#breaking-change-version-history). If so, read the
 relevant section(s) first before proceeding with the general guidelines below.
 
+## Supported Versions
+
+kube-router generally only supports the current major.minor release. Bug fixes
+and security patches are applied to the latest release, and users are encouraged
+to stay up to date. In exceptional cases, we may backport critical fixes to the
+previous minor release on request. If you need a backport, please open an issue
+describing the bug and why upgrading to the latest release is not feasible.
+
 ## General Guidelines
 
 ### Image Pull Policy
@@ -79,11 +87,11 @@ kubectl -n kube-system delete pods -l k8s-app=kube-router
 After updating a DaemonSet template, old DaemonSet pods will be killed, and new DaemonSet pods will be created
 automatically, in a controlled fashion
 
-If your global BGP peers supports gracefull restarts and has it enabled,
+If your global BGP peers supports graceful restarts and has it enabled,
 [rolling updates](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/) can be used to upgrade your
 kube-router DaemonSet without network downtime.
 
-To enable gracefull BGP restart kube-router must be started with `--bgp-graceful-restart`
+To enable graceful BGP restart kube-router must be started with `--bgp-graceful-restart`
 
 To enable rolling updates on your kube-router DaemonSet modify it and add a updateStrategy
 
@@ -99,7 +107,7 @@ maxUnavailable controls the maximum number of pods to simultaneously upgrade
 Starting from the top of the DaemonSet, it should look like this after you are done editing
 
 ```yaml
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   labels:
@@ -117,77 +125,6 @@ spec:
 
 ## Breaking Change Version History
 
-This section covers version specific upgrade instructions.
-
-### v0.0.X alpha versions
-
-While kube-router is in its alpha stage changes can be expected to be rapid.
-Therefor we cannot guarantee that a new alpha release will not break previous
-expected behavior.
-
-### v0.0.17 (aka v0.1.0-rc1)
-
-This version brings changes to hairpin and BGP peering CLI/annotation
-configuration flags/keys.
-
-CLI flag changes:
-
-- OLD: `--peer-router` -> NEW: `--peer-router-ips`
-- OLD: `--peer-asn` -> NEW: `--peer-router-asns`
-
-CLI flag additions:
-
-- NEW: `--peer-router-passwords`
-
-Annotation key changes:
-
-- OLD: `kube-router.io/hairpin-mode=` -> NEW:
-  `kube-router.io/service.hairpin=`
-- OLD: `net.kuberouter.nodeasn=` -> NEW: `kube-router.io/node.asn=`
-- OLD: `net.kuberouter.node.bgppeer.address=` -> NEW: `kube-router.io/peer.ips`
-- OLD: `net.kuberouter.node.bgppeer.asn` -> NEW: `kube-router.io/peer.asns`
-
-Annotation key additions:
-
-- NEW: `kube-router.io/peer.passwords`
-
-#### v0.0.17 Upgrade Procedure
-
-For CLI flag changes, all that is required is to change the flag names you use
-above to their new names at the same time that you change the image version.
-
-```sh
-kubectl -n kube-system edit ds kube-router
-```
-
-For Annotations, the recommended approach is to copy all the values of
-your current annotations into new annotations with the updated keys.
-
-You can get a quick look at all your service and node annotations with these
-commands:
-
-```sh
-kubectl describe services --all-namespaces |grep -E '^(Name:|Annotations:)'
-kubectl describe nodes |grep -E '^(Name:|Annotations:)'
-```
-
-For example if you have a service annotation to enable Hairpin mode like:
-
-```sh
-Name:              hairpin-service
-Annotations:       kube-router.io/hairpin-mode=
-```
-
-You will then want to make a new annotation with the new key:
-
-```sh
-kubectl annotate service hairpin-service "kube-router.io/service.hairpin="
-```
-
-Once all new annotations are created, proceed with the
-[General Guidelines](#general-guidelines). After the upgrades tested and
-complete, you can delete the old annotations.
-
-```sh
-kubectl annotate service hairpin-service "kube-router.io/hairpin-mode-"
-```
+Breaking changes for major and minor releases (v1.0+) are documented in the
+[GitHub release notes](https://github.com/cloudnativelabs/kube-router/releases) for each version. Please review the
+release notes for any versions you are upgrading across.

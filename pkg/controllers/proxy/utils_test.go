@@ -1,32 +1,64 @@
 package proxy
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"strconv"
 	"testing"
 
+	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
+	"github.com/moby/ipvs"
 	"github.com/stretchr/testify/assert"
+	"github.com/vishvananda/netlink"
+	v1 "k8s.io/api/core/v1"
 )
 
 func getMoqNSC() *NetworkServicesController {
-	lnm := NewLinuxNetworkMock()
-	mockedLinuxNetworking := &LinuxNetworkingMock{
-		getKubeDummyInterfaceFunc:          lnm.getKubeDummyInterface,
-		ipAddrAddFunc:                      lnm.ipAddrAdd,
-		ipvsAddServerFunc:                  lnm.ipvsAddServer,
-		ipvsAddServiceFunc:                 lnm.ipvsAddService,
-		ipvsDelServiceFunc:                 lnm.ipvsDelService,
-		ipvsGetDestinationsFunc:            lnm.ipvsGetDestinations,
-		ipvsGetServicesFunc:                lnm.ipvsGetServices,
-		setupPolicyRoutingForDSRFunc:       lnm.setupPolicyRoutingForDSR,
-		setupRoutesForExternalIPForDSRFunc: lnm.setupRoutesForExternalIPForDSR,
+	// Create a minimal mock using moq-generated LinuxNetworkingMock
+	mock := &LinuxNetworkingMock{
+		getKubeDummyInterfaceFunc: func() (netlink.Link, error) {
+			return netlink.LinkByName("lo")
+		},
+		ipAddrAddFunc: func(iface netlink.Link, ip string, nodeIP string, addRoute bool) error {
+			return nil
+		},
+		ipvsAddServerFunc: func(ipvsSvc *ipvs.Service, ipvsDst *ipvs.Destination) error {
+			return nil
+		},
+		ipvsAddServiceFunc: func(svcs []*ipvs.Service, vip net.IP, protocol uint16, port uint16,
+			persistent bool, persistentTimeout int32, scheduler string,
+			flags schedFlags) ([]*ipvs.Service, *ipvs.Service, error) {
+			return svcs, &ipvs.Service{Address: vip, Protocol: protocol, Port: port}, nil
+		},
+		ipvsDelServiceFunc: func(ipvsSvc *ipvs.Service) error {
+			return nil
+		},
+		ipvsGetDestinationsFunc: func(ipvsSvc *ipvs.Service) ([]*ipvs.Destination, error) {
+			return []*ipvs.Destination{}, nil
+		},
+		ipvsGetServicesFunc: func() ([]*ipvs.Service, error) {
+			return []*ipvs.Service{}, nil
+		},
+		setupPolicyRoutingForDSRFunc: func(setupIPv4 bool, setupIPv6 bool) error {
+			return nil
+		},
+		setupRoutesForExternalIPForDSRFunc: func(serviceInfo serviceInfoMap, setupIPv4 bool, setupIPv6 bool) error {
+			return nil
+		},
+	}
+
+	krNode := &utils.LocalKRNode{
+		KRNode: utils.KRNode{
+			NodeName:  "node-1",
+			PrimaryIP: net.ParseIP("10.0.0.0"),
+		},
 	}
 	return &NetworkServicesController{
-		primaryIP:    net.ParseIP("10.0.0.0"),
-		nodeHostName: "node-1",
-		ln:           mockedLinuxNetworking,
-		fwMarkMap:    map[uint32]string{},
+		krNode:    krNode,
+		ln:        mock,
+		fwMarkMap: map[uint32]string{},
 	}
 }
 
@@ -139,9 +171,7 @@ func TestNetworkServicesController_getLabelFromMap(t *testing.T) {
 	}
 	copyLabels := func(srcLbls map[string]string) map[string]string {
 		dstLbls := map[string]string{}
-		for k, v := range srcLbls {
-			dstLbls[k] = v
-		}
+		maps.Copy(dstLbls, srcLbls)
 		return dstLbls
 	}
 	t.Run("return blank when passed labels don't contain service-proxy-name label", func(t *testing.T) {
@@ -164,4 +194,149 @@ func TestNetworkServicesController_getLabelFromMap(t *testing.T) {
 		assert.Equal(t, "foo", lbl, "should return value when service-proxy-name passed")
 		assert.Nil(t, err, "error should be nil when the label exists")
 	})
+}
+
+func TestIsValidKubeRouterServiceArtifact(t *testing.T) {
+	// Mock data
+	service1 := &serviceInfo{
+		clusterIPs:      []string{"10.0.0.1"},
+		externalIPs:     []string{"192.168.1.1"},
+		loadBalancerIPs: []string{"172.16.0.1"},
+		nodePort:        30000,
+	}
+	service2 := &serviceInfo{
+		clusterIPs:      []string{"10.0.0.2"},
+		externalIPs:     []string{"192.168.1.2"},
+		loadBalancerIPs: []string{"172.16.0.2"},
+		nodePort:        30001,
+	}
+	service3 := &serviceInfo{
+		clusterIPs:      []string{"10.0.0.3"},
+		externalIPs:     []string{"192.168.1.3"},
+		loadBalancerIPs: []string{"172.16.0.3"},
+	}
+
+	krNode := &utils.LocalKRNode{
+		KRNode: utils.KRNode{
+			NodeName:  "node-1",
+			PrimaryIP: net.ParseIP("192.168.1.10"),
+		},
+	}
+
+	nsc := &NetworkServicesController{
+		krNode:              krNode,
+		nodeportBindOnAllIP: false,
+	}
+	nsc.setServiceMap(map[string]*serviceInfo{
+		"service1": service1,
+		"service2": service2,
+		"service3": service3,
+	})
+
+	tests := []struct {
+		address  net.IP
+		port     int
+		expected bool
+		err      error
+	}{
+		{net.ParseIP("10.0.0.1"), 0, true, nil},
+		{net.ParseIP("192.168.1.1"), 0, true, nil},
+		{net.ParseIP("172.16.0.1"), 0, true, nil},
+		{net.ParseIP("10.0.0.2"), 0, true, nil},
+		{net.ParseIP("192.168.1.2"), 0, true, nil},
+		{net.ParseIP("172.16.0.2"), 0, true, nil},
+		{net.ParseIP("192.168.1.10"), 30000, true, nil},
+		{net.ParseIP("192.168.1.10"), 30001, true, nil},
+		{net.ParseIP("192.168.1.4"), 0, false, errors.New("service not found for address 192.168.1.4")},
+		{net.ParseIP("192.168.1.10"), 0, false, errors.New("service not found for address 192.168.1.10")},
+	}
+
+	for _, test := range tests {
+		result, err := nsc.isValidKubeRouterServiceArtifact(test.address, test.port, nil)
+		if result != test.expected || (err != nil && err.Error() != test.err.Error()) {
+			t.Errorf("lookupServiceByAddress(%v) = %v, %v; want %v, %v", test.address, result, err, test.expected, test.err)
+		}
+	}
+}
+
+// TestIsValidKubeRouterServiceArtifactBindOnAllIP checks NodePorts against the caller supplied local IP map
+func TestIsValidKubeRouterServiceArtifactBindOnAllIP(t *testing.T) {
+	// krNode is unused here, but set so that a bind-on-primary-IP case added later doesn't nil panic
+	krNode := &utils.LocalKRNode{
+		KRNode: utils.KRNode{
+			NodeName:  "node-1",
+			PrimaryIP: net.ParseIP("192.168.1.10"),
+		},
+	}
+	nsc := &NetworkServicesController{
+		krNode:              krNode,
+		nodeportBindOnAllIP: true,
+	}
+	nsc.setServiceMap(map[string]*serviceInfo{
+		"service1": {clusterIPs: []string{"10.0.0.1"}, nodePort: 30000},
+	})
+
+	// same shape that syncIpvsFirewall hands us
+	localIPs := map[v1.IPFamily][]net.IP{
+		v1.IPv4Protocol: {net.ParseIP("192.168.1.10")},
+		v1.IPv6Protocol: {net.ParseIP("2001:db8::1")},
+	}
+
+	tests := []struct {
+		name     string
+		address  net.IP
+		port     int
+		localIPs map[v1.IPFamily][]net.IP
+		expected bool
+	}{
+		{"IPv4 nodeport on a local IP is valid", net.ParseIP("192.168.1.10"), 30000, localIPs, true},
+		{"IPv4 nodeport on a non-local IP is not valid", net.ParseIP("192.168.1.99"), 30000, localIPs, false},
+		{"IPv6 nodeport on a local IP is valid", net.ParseIP("2001:db8::1"), 30000, localIPs, true},
+		{"IPv6 nodeport on a non-local IP is not valid", net.ParseIP("2001:db8::99"), 30000, localIPs, false},
+		{"a nil local IP map matches nothing", net.ParseIP("192.168.1.10"), 30000, nil, false},
+		{"an empty local IP map matches nothing", net.ParseIP("2001:db8::1"), 30000,
+			map[v1.IPFamily][]net.IP{}, false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := nsc.isValidKubeRouterServiceArtifact(test.address, test.port, test.localIPs)
+			assert.Equal(t, test.expected, result,
+				"unexpected validity for address %s on port %d", test.address, test.port)
+			if test.expected {
+				assert.NoError(t, err, "a service that was matched shouldn't also return an error")
+			} else {
+				assert.EqualError(t, err, fmt.Sprintf("service not found for address %s", test.address),
+					"an unmatched address should return a service not found error")
+			}
+		})
+	}
+}
+
+func TestHasAnyIPs(t *testing.T) {
+	tests := []struct {
+		name     string
+		ipMap    map[v1.IPFamily][]net.IP
+		expected bool
+	}{
+		{"nil map", nil, false},
+		{"empty map", map[v1.IPFamily][]net.IP{}, false},
+		{"both families present but empty",
+			map[v1.IPFamily][]net.IP{v1.IPv4Protocol: {}, v1.IPv6Protocol: {}}, false},
+		{"IPv4 only",
+			map[v1.IPFamily][]net.IP{v1.IPv4Protocol: {net.ParseIP("10.0.0.1")}, v1.IPv6Protocol: {}}, true},
+		{"IPv6 only",
+			map[v1.IPFamily][]net.IP{v1.IPv4Protocol: {}, v1.IPv6Protocol: {net.ParseIP("2001:db8::1")}}, true},
+		{"dual-stack",
+			map[v1.IPFamily][]net.IP{
+				v1.IPv4Protocol: {net.ParseIP("10.0.0.1")},
+				v1.IPv6Protocol: {net.ParseIP("2001:db8::1")},
+			}, true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, hasAnyIPs(test.ipMap), "unexpected result for %v", test.ipMap)
+		})
+	}
 }

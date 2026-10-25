@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	v1core "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
@@ -13,26 +13,6 @@ import (
 const (
 	IPInIPHeaderLength = 20
 )
-
-// ServiceForEndpoints given Endpoint object return Service API object if it exists
-func ServiceForEndpoints(ci *cache.Indexer, ep *v1core.Endpoints) (interface{}, bool, error) {
-	key, err := cache.MetaNamespaceKeyFunc(ep)
-	if err != nil {
-		return nil, false, err
-	}
-	klog.V(2).Infof("key for looking up service from Endpoint is: %s", key)
-
-	item, exists, err := (*ci).GetByKey(key)
-	if err != nil {
-		return nil, false, err
-	}
-
-	if !exists {
-		return nil, false, nil
-	}
-
-	return item, true, nil
-}
 
 // ServiceNameforEndpointSlice returns the name of the service that created the EndpointSlice for a given EndpointSlice
 //
@@ -46,7 +26,7 @@ func ServiceForEndpoints(ci *cache.Indexer, ep *v1core.Endpoints) (interface{}, 
 //
 // We'll all through all of these and do our best to identify the service's name, if we aren't able to find any of these
 // or they disagree with each other we'll throw an error
-func ServiceNameforEndpointSlice(es *discovery.EndpointSlice) (string, error) {
+func ServiceNameforEndpointSlice(es *discoveryv1.EndpointSlice) (string, error) {
 	const serviceNameLabel = "kubernetes.io/service-name"
 	var ownerRefName, labelSvcName, generateName, finalSvcName string
 
@@ -79,21 +59,21 @@ func ServiceNameforEndpointSlice(es *discovery.EndpointSlice) (string, error) {
 	}
 
 	// At this point we do some checks to ensure that the final owning service name is sane. Specifically, we want to
-	// check it against labelSvcName and ownerRefName if they were not blank and return error if they don't agree. We
+	// check it against labelSvcName and ownerRefName if they were not blank and log a debug log if they don't agree. We
 	// don't worry about generateName as that is less conclusive.
 	//
-	// From above, we already know that if labelSvcName was not blank then it is equal to finalSvcName, so we only need
-	// to worry about ownerRefName
+	// See: https://github.com/cloudnativelabs/kube-router/issues/1957 for more information
 	if ownerRefName != "" && finalSvcName != ownerRefName {
-		return "", fmt.Errorf("the ownerReferences field on EndpointSlice (%s) doesn't agree with with the %s label "+
-			"(%s) for %s/%s EndpointSlice", ownerRefName, serviceNameLabel, labelSvcName, es.Namespace, es.Name)
+		klog.V(1).Infof("The metadata ownerReference name %s and the label service name (%s) %s don't appear to "+
+			"match for EndpointSlice %s/%s. In this case we prefer the label service name.",
+			ownerRefName, serviceNameLabel, labelSvcName, es.Namespace, es.Name)
 	}
 
 	return finalSvcName, nil
 }
 
 // ServiceForEndpoints given EndpointSlice object return Service API object if it exists
-func ServiceForEndpointSlice(ci *cache.Indexer, es *discovery.EndpointSlice) (interface{}, bool, error) {
+func ServiceForEndpointSlice(ci *cache.Indexer, es *discoveryv1.EndpointSlice) (any, bool, error) {
 	svcName, err := ServiceNameforEndpointSlice(es)
 	if err != nil {
 		return nil, false, err
@@ -119,7 +99,7 @@ func ServiceForEndpointSlice(ci *cache.Indexer, es *discovery.EndpointSlice) (in
 // kube-router as there is no need to execute logic on most headless changes. Function takes a generic interface as its
 // input parameter so that it can be used more easily in early processing if needed. If a non-service object is given,
 // function will return false.
-func ServiceHasNoClusterIP(obj interface{}) bool {
+func ServiceHasNoClusterIP(obj any) bool {
 	if svc, _ := obj.(*v1core.Service); svc != nil {
 		if svc.Spec.Type == v1core.ServiceTypeClusterIP {
 			if ClusterIPIsNone(svc.Spec.ClusterIP) && containsOnlyNone(svc.Spec.ClusterIPs) {

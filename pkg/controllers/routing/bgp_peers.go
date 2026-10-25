@@ -5,27 +5,86 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/v2/pkg/bgp"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/options"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
-	gobgpapi "github.com/osrg/gobgp/v3/api"
-	gobgp "github.com/osrg/gobgp/v3/pkg/server"
+	gobgpapi "github.com/osrg/gobgp/v4/api"
+	gobgp "github.com/osrg/gobgp/v4/pkg/server"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 )
 
+// gobgp reports these when the peer is already in the state we asked for, so there's nothing to do
+const (
+	gobgpPeerAlreadyExists = "can't overwrite the existing peer"
+	gobgpPeerAlreadyGone   = "can't delete a peer configuration"
+)
+
+// configurePeerAfiSafis configures the AFI-SAFI (Address Family Indicator / Subsequent Address Family Indicator)
+// settings on a BGP peer based on the node's IP capabilities. This function must be called regardless of graceful
+// restart settings to ensure proper route advertisement for dual-stack environments. Without explicit AFI-SAFI
+// configuration, GoBGP defaults to only the address family matching the peer's IP address type, which prevents
+// IPv6 route advertisement when peering over IPv4.
+//
+// Parameters:
+//   - peer: The GoBGP peer configuration to modify
+//   - node: A node that implements NodeFamilyAware to determine IPv4/IPv6 capabilities
+//   - gracefulRestartEnabled: Whether to enable MP-BGP Graceful Restart for each AFI-SAFI
+func configurePeerAfiSafis(peer *gobgpapi.Peer, node utils.NodeFamilyAware, gracefulRestartEnabled bool) {
+	if node.IsIPv4Capable() {
+		afiSafi := gobgpapi.AfiSafi{
+			Config: &gobgpapi.AfiSafiConfig{
+				Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
+				Enabled: true,
+			},
+		}
+		if gracefulRestartEnabled {
+			afiSafi.MpGracefulRestart = &gobgpapi.MpGracefulRestart{
+				Config: &gobgpapi.MpGracefulRestartConfig{
+					Enabled: true,
+				},
+				State: &gobgpapi.MpGracefulRestartState{},
+			}
+		}
+		peer.AfiSafis = append(peer.AfiSafis, &afiSafi)
+	}
+
+	if node.IsIPv6Capable() {
+		afiSafi := gobgpapi.AfiSafi{
+			Config: &gobgpapi.AfiSafiConfig{
+				Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST},
+				Enabled: true,
+			},
+		}
+		if gracefulRestartEnabled {
+			afiSafi.MpGracefulRestart = &gobgpapi.MpGracefulRestart{
+				Config: &gobgpapi.MpGracefulRestartConfig{
+					Enabled: true,
+				},
+				State: &gobgpapi.MpGracefulRestartState{},
+			}
+		}
+		peer.AfiSafis = append(peer.AfiSafis, &afiSafi)
+	}
+}
+
 // Refresh the peer relationship with rest of the nodes in the cluster (iBGP peers). Node add/remove
 // events should ensure peer relationship with only currently active nodes. In case
 // we miss any events from API server this method which is called periodically
 // ensures peer relationship with removed nodes is deleted.
-func (nrc *NetworkRoutingController) syncInternalPeers() {
+func (nrc *NetworkRoutingController) syncInternalPeers() error {
 	nrc.mu.Lock()
 	defer nrc.mu.Unlock()
+
+	// Joined so a peer we couldn't add or remove surfaces as a failed sync, not just a log line
+	var syncErr error
 
 	start := time.Now()
 	defer func() {
@@ -39,27 +98,30 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 	// get the current list of the nodes from API server
 	nodes := nrc.nodeLister.List()
 
-	if nrc.MetricsEnabled {
-		metrics.ControllerBPGpeers.Set(float64(len(nodes)))
-	}
 	// establish peer and add Pod CIDRs with current set of nodes
 	currentNodes := make([]string, 0)
+	// Tracks Nodes we couldn't evaluate this pass; while any exist we skip peer deletion below,
+	// because we can't tell which activeNodes entry belongs to an unparseable Node and deleting
+	// on a transient address outage would tear down a working peer
+	nodesFailedToParse := false
 	for _, obj := range nodes {
 		node := obj.(*v1core.Node)
-		nodeIP, err := utils.GetPrimaryNodeIP(node)
+		targetNode, err := utils.NewRemoteKRNode(node)
 		if err != nil {
-			klog.Errorf("Failed to find a node IP and therefore cannot sync internal BGP Peer: %v", err)
+			klog.Errorf("failed to create KRNode from node object: %v", err)
+			syncErr = errors.Join(syncErr, fmt.Errorf("evaluate node %s: %w", node.Name, err))
+			nodesFailedToParse = true
 			continue
 		}
 
 		// skip self
-		if nodeIP.String() == nrc.primaryIP.String() {
+		if targetNode.GetPrimaryNodeIP().Equal(nrc.krNode.GetPrimaryNodeIP()) {
 			continue
 		}
 
 		// we are rr-client peer only with rr-server
 		if nrc.bgpRRClient {
-			if _, ok := node.ObjectMeta.Annotations[rrServerAnnotation]; !ok {
+			if _, ok := node.Annotations[rrServerAnnotation]; !ok {
 				continue
 			}
 		}
@@ -67,53 +129,51 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		// if node full mesh is not requested then just peer with nodes with same ASN
 		// (run iBGP among same ASN peers)
 		if !nrc.bgpFullMeshMode {
-			nodeasn, ok := node.ObjectMeta.Annotations[nodeASNAnnotation]
+			nodeasn, ok := node.Annotations[nodeASNAnnotation]
 			if !ok {
 				klog.Infof("Not peering with the Node %s as ASN number of the node is unknown.",
-					nodeIP.String())
+					targetNode.GetPrimaryNodeIP().String())
 				continue
 			}
 
 			asnNo, err := strconv.ParseUint(nodeasn, 0, asnMaxBitSize)
 			if err != nil {
 				klog.Infof("Not peering with the Node %s as ASN number of the node is invalid.",
-					nodeIP.String())
+					targetNode.GetPrimaryNodeIP().String())
 				continue
 			}
 
 			// if the nodes ASN number is different from ASN number of current node skip peering
 			if nrc.nodeAsnNumber != uint32(asnNo) {
 				klog.Infof("Not peering with the Node %s as ASN number of the node is different.",
-					nodeIP.String())
+					targetNode.GetPrimaryNodeIP().String())
 				continue
 			}
 		}
 
-		targetNodeIsIPv4 := nodeIP.To4() != nil
-		sourceNodeIsIPv4 := nrc.primaryIP.To4() != nil
-		ipv4NodeIPs, ipv6NodeIPs := utils.GetAllNodeIPs(node)
-		targetNodeIsIPv4Capable := utils.FindBestIPv4NodeAddress(nodeIP, ipv4NodeIPs) != nil
-		targetNodeIsIPv6Capable := utils.FindBestIPv6NodeAddress(nodeIP, ipv6NodeIPs) != nil
+		targetNodeIsIPv4 := targetNode.GetPrimaryNodeIP().To4() != nil
+		sourceNodeIsIPv4 := nrc.krNode.GetPrimaryNodeIP().To4() != nil
 
 		if targetNodeIsIPv4 != sourceNodeIsIPv4 {
 			klog.Warningf("Not peering with Node %s as it's primary IP (%s) uses a different protocol than "+
-				"our primary IP (%s)", node.ObjectMeta.Name, nodeIP, nrc.primaryIP)
+				"our primary IP (%s)", node.Name, targetNode.GetPrimaryNodeIP(),
+				nrc.krNode.GetPrimaryNodeIP())
 			continue
 		}
 
-		currentNodes = append(currentNodes, nodeIP.String())
-		nrc.activeNodes[nodeIP.String()] = true
+		currentNodes = append(currentNodes, targetNode.GetPrimaryNodeIP().String())
+		nrc.activeNodes[targetNode.GetPrimaryNodeIP().String()] = true
 		// explicitly set neighbors.transport.config.local-address with primaryIP which is configured
 		// as their neighbor address at the remote peers.
 		// this prevents the controller from initiating connection to its peers with a different IP address
 		// when multiple L3 interfaces are active.
 		n := &gobgpapi.Peer{
 			Conf: &gobgpapi.PeerConf{
-				NeighborAddress: nodeIP.String(),
+				NeighborAddress: targetNode.GetPrimaryNodeIP().String(),
 				PeerAsn:         nrc.nodeAsnNumber,
 			},
 			Transport: &gobgpapi.Transport{
-				LocalAddress: nrc.primaryIP.String(),
+				LocalAddress: nrc.krNode.GetPrimaryNodeIP().String(),
 				RemotePort:   nrc.bgpPort,
 			},
 		}
@@ -125,47 +185,17 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 				DeferralTime:    uint32(nrc.bgpGracefulRestartDeferralTime.Seconds()),
 				LocalRestarting: true,
 			}
-
-			// We choose to only peer using the protocol of the node's primary IP
-			if targetNodeIsIPv4Capable {
-				afiSafi := gobgpapi.AfiSafi{
-					Config: &gobgpapi.AfiSafiConfig{
-						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-						Enabled: true,
-					},
-					MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-						Config: &gobgpapi.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-						State: &gobgpapi.MpGracefulRestartState{},
-					},
-				}
-				n.AfiSafis = append(n.AfiSafis, &afiSafi)
-			}
-			if targetNodeIsIPv6Capable {
-				afiSafi := gobgpapi.AfiSafi{
-					Config: &gobgpapi.AfiSafiConfig{
-						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST},
-						Enabled: true,
-					},
-					MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-						Config: &gobgpapi.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-						State: &gobgpapi.MpGracefulRestartState{},
-					},
-				}
-				n.AfiSafis = append(n.AfiSafis, &afiSafi)
-			}
 		}
+
+		configurePeerAfiSafis(n, targetNode, nrc.bgpGracefulRestart)
 
 		// we are rr-server peer with other rr-client with reflection enabled
 		if nrc.bgpRRServer {
-			if _, ok := node.ObjectMeta.Annotations[rrClientAnnotation]; ok {
+			if _, ok := node.Annotations[rrClientAnnotation]; ok {
 				// add rr options with clusterId
 				n.RouteReflector = &gobgpapi.RouteReflector{
 					RouteReflectorClient:    true,
-					RouteReflectorClusterId: fmt.Sprint(nrc.bgpClusterID),
+					RouteReflectorClusterId: nrc.bgpClusterID,
 				}
 			}
 		}
@@ -174,22 +204,24 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 		if err := nrc.bgpServer.AddPeer(context.Background(), &gobgpapi.AddPeerRequest{
 			Peer: n,
 		}); err != nil {
-			if !strings.Contains(err.Error(), "can't overwrite the existing peer") {
-				klog.Errorf("Failed to add node %s as peer due to %s", nodeIP.String(), err)
+			if !strings.Contains(err.Error(), gobgpPeerAlreadyExists) {
+				klog.Errorf("Failed to add node %s as peer due to %s", targetNode.GetPrimaryNodeIP(), err)
+				syncErr = errors.Join(syncErr, fmt.Errorf("add peer %s: %w", targetNode.GetPrimaryNodeIP(), err))
 			}
 		}
+	}
+
+	// A Node we couldn't evaluate contributes no entry to currentNodes, which would make its
+	// active peer look stale below. Defer deletion until every Node parses again; thanks to the
+	// retry behavior above, genuinely removed peers are cleaned up on a later pass
+	if nodesFailedToParse {
+		return syncErr
 	}
 
 	// find the list of the node removed, from the last known list of active nodes
 	removedNodes := make([]string, 0)
 	for ip := range nrc.activeNodes {
-		stillActive := false
-		for _, node := range currentNodes {
-			if ip == node {
-				stillActive = true
-				break
-			}
-		}
+		stillActive := slices.Contains(currentNodes, ip)
 		if !stillActive {
 			removedNodes = append(removedNodes, ip)
 		}
@@ -198,10 +230,19 @@ func (nrc *NetworkRoutingController) syncInternalPeers() {
 	// delete the neighbor for the nodes that are removed
 	for _, ip := range removedNodes {
 		if err := nrc.bgpServer.DeletePeer(context.Background(), &gobgpapi.DeletePeerRequest{Address: ip}); err != nil {
-			klog.Errorf("Failed to remove node %s as peer due to %s", ip, err)
+			// Mirrors the add case above, since gobgp already agrees the peer is gone
+			if !strings.Contains(err.Error(), gobgpPeerAlreadyGone) {
+				klog.Errorf("Failed to remove node %s as peer due to %s", ip, err)
+				syncErr = errors.Join(syncErr, fmt.Errorf("delete peer %s: %w", ip, err))
+				// Keep the address in activeNodes so the next periodic sync retries the deletion,
+				// otherwise a transient gobgp failure leaves the peer configured forever
+				continue
+			}
 		}
 		delete(nrc.activeNodes, ip)
 	}
+
+	return syncErr
 }
 
 // connectToExternalBGPPeers adds all the configured eBGP peers (global or node specific) as neighbours
@@ -232,43 +273,19 @@ func (nrc *NetworkRoutingController) connectToExternalBGPPeers(server *gobgp.Bgp
 		}
 
 		if bgpGracefulRestart {
+			if n.Bfd != nil && n.Bfd.Enabled {
+				klog.Warning("Both BFD and BGP Graceful Restart should not be enabled at the same time. " +
+					"See docs/bgp.md for details.")
+			}
 			n.GracefulRestart = &gobgpapi.GracefulRestart{
 				Enabled:         true,
 				RestartTime:     uint32(bgpGracefulRestartTime.Seconds()),
 				DeferralTime:    uint32(bgpGracefulRestartDeferralTime.Seconds()),
 				LocalRestarting: true,
 			}
-
-			if nrc.isIPv4Capable {
-				n.AfiSafis = []*gobgpapi.AfiSafi{
-					{
-						Config: &gobgpapi.AfiSafiConfig{
-							Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP, Safi: gobgpapi.Family_SAFI_UNICAST},
-							Enabled: true,
-						},
-						MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-							Config: &gobgpapi.MpGracefulRestartConfig{
-								Enabled: true,
-							},
-						},
-					},
-				}
-			}
-			if nrc.isIPv6Capable {
-				afiSafi := gobgpapi.AfiSafi{
-					Config: &gobgpapi.AfiSafiConfig{
-						Family:  &gobgpapi.Family{Afi: gobgpapi.Family_AFI_IP6, Safi: gobgpapi.Family_SAFI_UNICAST},
-						Enabled: true,
-					},
-					MpGracefulRestart: &gobgpapi.MpGracefulRestart{
-						Config: &gobgpapi.MpGracefulRestartConfig{
-							Enabled: true,
-						},
-					},
-				}
-				n.AfiSafis = append(n.AfiSafis, &afiSafi)
-			}
 		}
+
+		configurePeerAfiSafis(n, nrc.krNode, bgpGracefulRestart)
 		if peerMultihopTTL > 1 {
 			n.EbgpMultihop = &gobgpapi.EbgpMultihop{
 				Enabled:     true,
@@ -287,51 +304,23 @@ func (nrc *NetworkRoutingController) connectToExternalBGPPeers(server *gobgp.Bgp
 }
 
 // Does validation and returns neighbor configs
-func newGlobalPeers(ips []net.IP, ports []uint32, asns []uint32, passwords []string, localips []string,
-	holdtime float64, localAddress string) ([]*gobgpapi.Peer, error) {
-	peers := make([]*gobgpapi.Peer, 0)
+func newGlobalPeers(
+	peerConfigs bgp.PeerConfigs,
+	holdtime float64,
+	localAddress string,
+) []*gobgpapi.Peer {
+	peers := make([]*gobgpapi.Peer, len(peerConfigs))
 
-	// Validations
-	if len(ips) != len(asns) {
-		return nil, errors.New("invalid peer router config, the number of IPs and ASN numbers must be equal")
-	}
-
-	if len(ips) != len(passwords) && len(passwords) != 0 {
-		return nil, errors.New("invalid peer router config. The number of passwords should either be zero, or " +
-			"one per peer router. Use blank items if a router doesn't expect a password. Example: \"pass,,pass\" " +
-			"OR [\"pass\",\"\",\"pass\"]")
-	}
-
-	if len(ips) != len(ports) && len(ports) != 0 {
-		return nil, fmt.Errorf("invalid peer router config. The number of ports should either be zero, or "+
-			"one per peer router. If blank items are used, it will default to standard BGP port, %s. "+
-			"Example: \"port,,port\" OR [\"port\",\"\",\"port\"]", strconv.Itoa(options.DefaultBgpPort))
-	}
-
-	if len(ips) != len(localips) && len(localips) != 0 {
-		return nil, fmt.Errorf("invalid peer router config. The number of localIPs should either be zero, or "+
-			"one per peer router. If blank items are used, it will default to nodeIP, %s. "+
-			"Example: \"10.1.1.1,,10.1.1.2\" OR [\"10.1.1.1\",\"\",\"10.1.1.2\"]", localAddress)
-	}
-
-	for i := 0; i < len(ips); i++ {
-		if !((asns[i] >= 1 && asns[i] <= 23455) ||
-			(asns[i] >= 23457 && asns[i] <= 63999) ||
-			(asns[i] >= 64512 && asns[i] <= 65534) ||
-			(asns[i] >= 131072 && asns[i] <= 4199999999) ||
-			(asns[i] >= 4200000000 && asns[i] <= 4294967294)) {
-			return nil, fmt.Errorf("reserved ASN number \"%d\" for global BGP peer",
-				asns[i])
-		}
-
+	for i, peerConfig := range peerConfigs {
 		// explicitly set neighbors.transport.config.local-address with primaryIP which is configured
 		// as their neighbor address at the remote peers.
 		// this prevents the controller from initiating connection to its peers with a different IP address
 		// when multiple L3 interfaces are active.
 		peer := &gobgpapi.Peer{
 			Conf: &gobgpapi.PeerConf{
-				NeighborAddress: ips[i].String(),
-				PeerAsn:         asns[i],
+				NeighborAddress: peerConfig.RemoteIP().String(),
+				PeerAsn:         peerConfig.RemoteASN(),
+				AuthPassword:    peerConfig.Password(),
 			},
 			Timers: &gobgpapi.Timers{Config: &gobgpapi.TimersConfig{HoldTime: uint64(holdtime)}},
 			Transport: &gobgpapi.Transport{
@@ -342,43 +331,40 @@ func newGlobalPeers(ips []net.IP, ports []uint32, asns []uint32, passwords []str
 			},
 		}
 
-		if len(ports) != 0 {
-			peer.Transport.RemotePort = ports[i]
+		if peerConfig.Port() != nil {
+			peer.Transport.RemotePort = *peerConfig.Port()
 		}
 
-		if len(passwords) != 0 {
-			peer.Conf.AuthPassword = passwords[i]
+		if peerConfig.LocalIP() != "" {
+			peer.Transport.LocalAddress = peerConfig.LocalIP()
 		}
 
-		// if localip is set and is non-blank for BGP configuration override primaryIP choice set for peer above
-		if len(localips) != 0 && localips[i] != "" {
-			peer.Transport.LocalAddress = localips[i]
-		}
+		peer.Bfd = peerConfig.BFD().ToGoBGP()
 
-		peers = append(peers, peer)
+		peers[i] = peer
 	}
 
-	return peers, nil
+	return peers
 }
 
 func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			node := obj.(*v1core.Node)
-			nodeIP, err := utils.GetPrimaryNodeIP(node)
+			targetNode, err := utils.NewRemoteKRNode(node)
 			if err != nil {
-				klog.Errorf(
-					"New node received, but we were unable to add it as we were couldn't find its node IP: %v", err)
+				klog.Errorf("failed to create KRNode from node object: %v", err)
 				return
 			}
 
-			klog.V(2).Infof("Received node %s added update from watch API so peer with new node", nodeIP)
+			klog.V(2).Infof("Received node %s added update from watch API so peer with new node",
+				targetNode.GetPrimaryNodeIP())
 			nrc.OnNodeUpdate(obj)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			// we are only interested in node add/delete, so skip update
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			node, ok := obj.(*v1core.Node)
 			if !ok {
 				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -391,11 +377,12 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 					return
 				}
 			}
-			nodeIP, err := utils.GetPrimaryNodeIP(node)
+			targetNode, err := utils.NewRemoteKRNode(node)
 			// In this case even if we can't get the NodeIP that's alright as the node is being removed anyway and
 			// future node lister operations that happen in OnNodeUpdate won't be affected as the node won't be returned
-			if err == nil {
-				klog.Infof("Received node %s removed update from watch API, so remove node from peer", nodeIP)
+			if err == nil && targetNode != nil {
+				klog.Infof("Received node %s removed update from watch API, so remove node from peer",
+					targetNode.GetPrimaryNodeIP())
 			} else {
 				klog.Infof("Received node (IP unavailable) removed update from watch API, so remove node " +
 					"from peer")
@@ -409,8 +396,8 @@ func (nrc *NetworkRoutingController) newNodeEventHandler() cache.ResourceEventHa
 // OnNodeUpdate Handle updates from Node watcher. Node watcher calls this method whenever there is
 // new node is added or old node is deleted. So peer up with new node and drop peering
 // from old node
-func (nrc *NetworkRoutingController) OnNodeUpdate(_ interface{}) {
-	if !nrc.bgpServerStarted {
+func (nrc *NetworkRoutingController) OnNodeUpdate(_ any) {
+	if !nrc.bgpServerStarted.Load() {
 		return
 	}
 
@@ -421,12 +408,15 @@ func (nrc *NetworkRoutingController) OnNodeUpdate(_ interface{}) {
 	}
 
 	if nrc.bgpEnableInternal {
-		nrc.syncInternalPeers()
+		// Event-driven, so the periodic sync in Run() owns reporting this
+		if err := nrc.syncInternalPeers(); err != nil {
+			klog.Errorf("Error syncing internal BGP peers: %v", err)
+		}
 	}
 
 	// skip if first round of disableSourceDestinationCheck() is not done yet, this is to prevent
-	// all the nodes for all the node add update trying to perfrom disableSourceDestinationCheck
-	if nrc.disableSrcDstCheck && nrc.initSrcDstCheckDone && nrc.ec2IamAuthorized {
+	// all the nodes for all the node add update trying to perform disableSourceDestinationCheck
+	if nrc.disableSrcDstCheck && nrc.initSrcDstCheckDone.Load() && nrc.ec2IamAuthorized.Load() {
 		nrc.disableSourceDestinationCheck()
 	}
 }

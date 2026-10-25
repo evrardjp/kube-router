@@ -1,124 +1,255 @@
 # Developer's Guide
 
-We aim to make local development and testing as straightforward as possible. For
-basic guidelines around contributing, see the [CONTRIBUTING](/CONTRIBUTING.md) document.
+For basic guidelines around contributing, see the [CONTRIBUTING](/CONTRIBUTING.md) document.
 
-There are a number of automation tools available to help with testing and
-building your changes, detailed below.
+## Prerequisites
 
-## Building kube-router
+- Go 1.25+ (see [go.mod](/go.mod) for the exact version)
+- Docker (builds run inside containers by default)
+- Make
 
-### Go version 1.19 or above is required to build kube-router
+## Building
 
-All the dependencies are specified as Go modules and will be fetched into your cache, so just run `make kube-router` or
-`go build pkg/cmd/kube-router.go` to build.
+All dependencies are managed as Go modules. To build:
 
-### Building A Docker Image
-
-Running `make container` will compile kube-router (if needed) and build a Docker
-image.  By default the container will be tagged with the last release version,
-and current commit ID.
-
-For example:
-
-```sh
-$ make container
-Building for GOARCH=amd64
-Verifying kube-router gobgp for ARCH=x86-64 ...
-Starting kube-router container image build for amd64 on amd64
-docker build -t "cloudnativelabs/kube-router-git:amd64-bug_fixes_for_v2.0.0" -f Dockerfile --build-arg ARCH="" \
-        --build-arg BUILDTIME_BASE="golang:1.20.9-alpine3.18" --build-arg RUNTIME_BASE="alpine:3.18" .
-Sending build context to Docker daemon  198.6MB
-Step 1/19 : ARG BUILDTIME_BASE=golang:1-alpine
-Step 2/19 : ARG RUNTIME_BASE=alpine:latest
-Step 3/19 : FROM ${BUILDTIME_BASE} as builder
- ---> 6cbc3ac54aa3
-Step 4/19 : ENV BUILD_IN_DOCKER=false
- ---> Using cache
- ---> aec11cc4a0cd
-
-...
-
-Removing intermediate container 371a162930f5
- ---> 1d3f742d559e
-Step 19/19 : ENTRYPOINT ["/usr/local/bin/kube-router"]
- ---> Running in d5ea6fda9fe4
-Removing intermediate container d5ea6fda9fe4
- ---> 17cfbc77e293
-[Warning] One or more build-args [ARCH] were not consumed
-Successfully built 17cfbc77e293
-Successfully tagged cloudnativelabs/kube-router-git:amd64-bug_fixes_for_v2.0.0
-Finished kube-router container image build.
+```bash
+make kube-router
 ```
 
-The following describes the rest of the portions of the container naming convention
+By default, builds run inside Docker for consistency. To build locally:
 
-* `kube-router-git` indicates that the container was built from git and not from a tag.
-* `amd64` indicates that it was built for the `amd64` architecture
-* `bug_fixes_for_v2.0.0` indicates the branch that the user was on when it was built
-
-### Pushing A Docker Image
-
-Running `make push` will push your container image to a Docker registry.  The default configuration will use the
-Docker Hub repository for the official kube-router images, cloudnativelabs/kube-router. You can push to a different
-repository by changing a couple settings, as described in [Image Options](#image-options)
-below.
-
-### Makefile Options
-
-There are several variables which can be modified in the Makefile to customize your builds. They are specified after
-your make command like this: `make OPTION=VALUE`. These options can also be set in your environment variables.
-
-For more details beyond the scope of this document, see the [Makefile](/Makefile) and run `make help`.
-
-#### Image Options
-
-You can configure the name and tag of the Docker image with a few variables
-passed to `make container` and `make push`.
-
-Example:
-
-```sh
-$ make container IMG_FQDN=quay.io IMG_NAMESPACE=bzub IMG_TAG=custom
-docker build -t "quay.io/bzub/kube-router-git:custom" .
-Sending build context to Docker daemon  151.5MB
-Step 1/4 : FROM alpine
- ---> a41a7446062d
-Step 2/4 : RUN apk add --no-cache iptables ipset
- ---> Using cache
- ---> 30e25a7640de
-Step 3/4 : COPY kube-router /
- ---> Using cache
- ---> c06f78fd02e8
-Step 4/4 : ENTRYPOINT /kube-router
- ---> Using cache
- ---> 5cfcfe54623e
-Successfully built 5cfcfe54623e
-Successfully tagged quay.io/bzub/kube-router-git:custom
+```bash
+BUILD_IN_DOCKER=false make kube-router
 ```
 
-* `REGISTRY` is derived from other options. Set this to something else to
-  quickly override the Docker image registry used to tag and push images.
-  * Note: This will override other variables below that make up the image
-    name/tag.
-* `IMG_FQDN` should be set if you are not using Docker Hub for images. In
-  the examples above `IMG_FQDN` is set to `quay.io`.
-* `IMG_NAMESPACE` is the Docker registry user or organization.  It is used in
-  URLs.
-  * Example: quay.io/IMG_NAMESPACE/kube-router
-* `NAME` goes onto the end of the Docker registry URL that will be used.
-  * Example: quay.io/cloudnativelabs/NAME
-* `IMG_TAG` is used to override the tag of the Docker image being built.
-* `DEV_SUFFIX` is appended to Docker image names that are not for release.  By
-  default these images get a name ending with `-git` to signify that they are
-  for testing purposes.
-  Example (DEV-SUFFIX=master-latest): quay.io/cloudnativelabs/kube-router-git:master-latest
+(Adding `BUILD_IN_DOCKER=false` will work for most other steps that utilize docker as well)
+
+### Building a Docker Image
+
+```bash
+make container
+```
+
+This compiles kube-router and builds a Docker image tagged with the current branch and architecture.
+
+### Pushing a Docker Image
+
+```bash
+make push
+```
+
+By default this pushes to the official `cloudnativelabs/kube-router` Docker Hub repository which most users will likely
+not have access to.
+Push to a different registry by setting image options:
+
+```bash
+make container IMG_FQDN=quay.io IMG_NAMESPACE=youruser IMG_TAG=custom
+```
+
+### Multi-Architecture Builds
+
+Specify the target architecture with `GOARCH`:
+
+```bash
+GOARCH=arm64 make kube-router
+GOARCH=s390x make container
+```
+
+Supported architectures: amd64 (default), arm64, arm, s390x, ppc64le, riscv64.
+
+## Testing
+
+kube-router has four levels of testing, each with its own Makefile target, and each entering the automatic
+pipelines at a different point:
+
+| Level | Target | Scope | Runs in CI on |
+|-------|--------|-------|---------------|
+| Unit | `make test` | Pure Go, no root, no kernel, mocked interfaces | Every PR and push (`ci.yml` checks phase) |
+| Privileged | `make test-privileged` | Real netlink/netns calls, needs root | Not wired into CI yet; run locally |
+| nftables integration | `make test-integration` | Real `nft` + kernel, no Kubernetes API | Every PR and push |
+| NetworkPolicy e2e | `make e2e-netpol` | Full kube-router deployed to a Kind cluster | Every PR and push, 4-way matrix |
+
+Canonically, the inner development loop is `make gofmt-fix && make lint && make test-pretty`, and that's
+also the first CI gate: the checks phase of [ci.yml](/.github/workflows/ci.yml) runs lint, unit tests, and a
+binary build on every PR and push, and the container build and release phases only run after it passes.
+The integration and e2e levels live in [ci-e2e-netpol.yml](/.github/workflows/ci-e2e-netpol.yml), which
+also triggers on every PR and push: integration tests run bare on the runner (`BUILD_IN_DOCKER=false`
+under sudo), while the e2e job fans out across a `{iptables, nftables} x {default-deny on, off}` matrix.
+The slow e2e lifecycle specs (controller restart, chain GC) are gated behind `E2E_LONG`, which CI sets only
+on push, tag, and manual dispatch - never on PRs - so PR feedback stays fast while merges to `master`,
+version branches, and release tags get the full regression coverage.
+
+Currently the privileged tests are the one level you have to remember to run yourself when touching
+netlink-heavy code (`pkg/routes`, for example), since CI doesn't run them anywhere yet.
+
+If you want to run every host-local level in one shot, `make test-all` chains the unit, privileged, and
+integration targets. The e2e suite is deliberately not part of it, since it stands up a Kind cluster and
+covering its full matrix takes several runs, but `make test-all e2e-netpol` composes the two when you want
+everything.
+
+### Unit Tests
+
+Run the full unit test suite:
+
+```bash
+make test
+```
+
+Or with formatted output (easier to understand for humans, uses `gotestsum`):
+
+```bash
+make test-pretty
+```
+
+### Privileged Tests
+
+A few tests (netlink, netns) need root to run, so they're excluded from `make test` and live in
+`*_privileged_test.go` files behind the `privileged` build tag. They run in a privileged container by
+default:
+
+```bash
+make test-privileged
+```
+
+### nftables Integration Tests
+
+The nftables backend of the NetworkPolicy controller has integration tests
+(`pkg/controllers/netpol/npc_nftables_integration_test.go`) that exercise it against the real `nft` binary
+and kernel via netlink, with no Kubernetes API server involved. They're behind the `integration` build tag,
+so `make test` skips them. By default they run in a privileged container that has `nftables` installed:
+
+```bash
+make test-integration
+```
+
+If you'd rather run them bare, you'll need root (or `CAP_NET_ADMIN`), `nft` 1.0.1 or newer, and a 5.2+
+kernel. The tests skip themselves gracefully when nftables isn't usable:
+
+```bash
+BUILD_IN_DOCKER=false make test-integration
+```
+
+Each test creates an isolated, uniquely named nftables table and deletes it via `t.Cleanup`, so no kernel
+state leaks between tests, even on failure. Because they talk to the real kernel, be sure to run them on a
+Linux machine (or let the default in-Docker mode handle that for you).
+
+### NetworkPolicy e2e Tests
+
+The NetworkPolicy e2e suite runs against a local dual-stack Kind cluster and needs `docker` plus `kind` (the
+harness installs `kind` for you if it's missing, which is the only step that needs sudo). A full run builds
+the image, creates the cluster, deploys kube-router, and runs the suite:
+
+```bash
+make e2e-netpol E2E_LONG=1 BACKEND=nftables DEFAULT_DENY=true
+```
+
+The suite runs specs in parallel via the ginkgo CLI. In order of precedence, the knobs you'll want are:
+
+- **`BACKEND`** - `iptables` - Which netpol backend to deploy (`iptables` or `nftables`).
+- **`DEFAULT_DENY`** - `false` - Deploy kube-router with `--netpol-default-deny=true`; the 10 default-deny
+  specs skip without it.
+- **`E2E_LONG`** - `NO_DEFAULT_SET` - Set to `1` to run the slow lifecycle specs (controller restart, chain
+  GC).
+- **`E2E_PROCS`** - `4` - Ginkgo parallel processes. The default matches free GitHub runners; set `1` for a
+  fully serial run.
+- **`E2E_FOCUS`** / **`E2E_SKIP`** - `NO_DEFAULT_SET` - Regexes passed to ginkgo `--focus` / `--skip` so you
+  can run a single spec instead of the whole suite.
+
+Because a given deployment is either default-deny or not, and either iptables or nftables, covering all 48
+specs takes a few runs with different combinations - any spec whose gate isn't met reports as skipped, not
+failed.
+
+When you're iterating on a failing spec (this works equally well for a human or an AI agent, since nothing
+in the loop needs sudo once `kind` is installed), keep the cluster alive and rerun just the tests:
+
+```bash
+# once, to stand the cluster up and keep it around
+SKIP_CLEANUP=1 make e2e-netpol BACKEND=nftables DEFAULT_DENY=true
+
+# rebuild + reload + restart kube-router, only needed if you changed kube-router code
+hack/e2e-netpol.sh refresh
+
+# rerun a single spec by name
+E2E_LONG=1 BACKEND=nftables E2E_FOCUS='chain GC' hack/e2e-netpol.sh run-tests
+
+# when you're done
+hack/e2e-netpol.sh delete-cluster
+```
+
+## Linting and Formatting
+
+Check formatting:
+
+```bash
+make gofmt
+```
+
+Auto-fix formatting:
+
+```bash
+make gofmt-fix
+```
+
+Run all linters (golangci-lint + markdownlint):
+
+```bash
+make lint
+```
+
+## Mock Generation
+
+When modifying interfaces that have associated mocks, regenerate them:
+
+```bash
+make gomoqs
+```
+
+Or regenerate a specific mock:
+
+```bash
+make pkg/controllers/proxy/linux_networking_moq.go
+```
+
+## Commit Messages
+
+This project uses [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
+Every commit message should follow the format `<type>(<scope>): <description>`.
+
+Common types: `feat`, `fix`, `doc`, `test`, `build`, `chore`, `fact` (refactor).
+
+The following scope abbreviations are used for the main controllers:
+
+- **NSC** -- Network Services Controller (`pkg/controllers/proxy/`)
+- **NRC** -- Network Routes Controller (`pkg/controllers/routing/`)
+- **NPC** -- Network Policy Controller (`pkg/controllers/netpol/`)
+
+Examples:
+
+```text
+feat(gobgp): add kube_router_bgp_peer_info metric
+fix(aws.go): load region before attempting to assume a role
+test(NSC): add comprehensive TCPMSS unit tests
+```
+
+## Development Workflow
+
+```bash
+git checkout -b feature_x
+
+# Make changes...
+
+make clean
+make gofmt-fix
+make
+```
+
+Run `make help` for a full list of available targets.
 
 ## Release Workflow
 
-See [Release Documentation](/RELEASE.md) for more information
+See [RELEASE.md](/RELEASE.md) for more information.
 
 ## Dependency Management
 
-kube-router uses go modules for managing dependencies see [upstream documentation](https://go.dev/blog/using-go-modules)
-for more information
+kube-router uses Go modules. See the
+[upstream documentation](https://go.dev/blog/using-go-modules) for more information.

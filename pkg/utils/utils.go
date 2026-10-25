@@ -1,20 +1,24 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
 	"sync"
+	"time"
 )
 
+const maxListenTestTimeout = 5 * time.Second
+
 type Listener interface {
-	OnUpdate(instance interface{})
+	OnUpdate(instance any)
 }
 
-type ListenerFunc func(instance interface{})
+type ListenerFunc func(instance any)
 
-func (f ListenerFunc) OnUpdate(instance interface{}) {
+func (f ListenerFunc) OnUpdate(instance any) {
 	f(instance)
 }
 
@@ -32,7 +36,7 @@ func (b *Broadcaster) Add(listener Listener) {
 }
 
 // Notify notifies an update to registered listeners
-func (b *Broadcaster) Notify(instance interface{}) {
+func (b *Broadcaster) Notify(instance any) {
 	b.listenerLock.RLock()
 	listeners := b.listeners
 	b.listenerLock.RUnlock()
@@ -47,55 +51,27 @@ func CloseCloserDisregardError(handler io.Closer) {
 	_ = handler.Close()
 }
 
-// ContainsIPv4Address checks a given string array to see if it contains a valid IPv4 address within it
-func ContainsIPv4Address(addrs []string) bool {
-	for _, addr := range addrs {
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// ContainsIPv6Address checks a given string array to see if it contains a valid IPv6 address within it
-func ContainsIPv6Address(addrs []string) bool {
-	for _, addr := range addrs {
-		ip := net.ParseIP(addr)
-		if ip == nil {
-			continue
-		}
-		if ip.To4() != nil {
-			continue
-		}
-		if ip.To16() != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// SliceContainsString checks to see if needle is contained within haystack, returns true if found, otherwise
-// returns false
-func SliceContainsString(needle string, haystack []string) bool {
-	for _, hay := range haystack {
-		if needle == hay {
-			return true
-		}
-	}
-	return false
-}
-
 // TCPAddressBindable checks to see if an IP/port is bindable by attempting to open a listener then closing it
 // returns nil if successful
 func TCPAddressBindable(addr string, port uint16) error {
+	ctx, cancel := context.WithTimeout(context.Background(), maxListenTestTimeout)
+	defer cancel()
 	endpoint := addr + ":" + strconv.Itoa(int(port))
-	ln, err := net.Listen("tcp", endpoint)
+	lc := net.ListenConfig{}
+	ln, err := lc.Listen(ctx, "tcp", endpoint)
 	if err != nil {
 		return fmt.Errorf("unable to open %s: %w", endpoint, err)
 	}
 	return ln.Close()
+}
+
+// ConvertMapKeysToSlice takes a map with a set of keys and then extracts the keys into a slice of the same length
+func ConvertMapKeysToSlice[K comparable, V any](mapContainingKeys map[K]V) []K {
+	keys := make([]K, 0, len(mapContainingKeys))
+
+	for k := range mapContainingKeys {
+		keys = append(keys, k)
+	}
+
+	return keys
 }

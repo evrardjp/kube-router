@@ -1,6 +1,6 @@
 # Pod Toolbox
 
-When kube-router is ran as a Pod within your Kubernetes cluster, it also ships
+When kube-router is run as a Pod within your Kubernetes cluster, it also ships
 with a number of tools automatically configured for your cluster.  These can be
 used to troubleshoot issues and learn more about how cluster networking is
 performed.
@@ -11,7 +11,7 @@ Here's a quick way to get going on a random node in your cluster:
 
 ```sh
 KR_POD=$(basename $(kubectl -n kube-system get pods -l k8s-app=kube-router --output name|head -n1))
-kubectl -n kube-system exec -it ${KR_POD} bash
+kubectl -n kube-system exec -it ${KR_POD} -- bash
 ```
 
 Use `kubectl -n kube-system get pods -l k8s-app=kube-router -o wide` to see what

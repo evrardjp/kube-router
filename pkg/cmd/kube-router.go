@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,25 +15,51 @@ import (
 	"github.com/cloudnativelabs/kube-router/v2/pkg/controllers/proxy"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/controllers/routing"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/healthcheck"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/k8s/indexers"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/options"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/svcip"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/version"
 	"k8s.io/klog/v2"
 
+	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const healthControllerChannelLength = 10
+const (
+	healthControllerChannelLength = 10
+	nftablesInitTimeout           = 30 * time.Second
+)
 
 // KubeRouter holds the information needed to run server
 type KubeRouter struct {
 	Client kubernetes.Interface
 	Config *options.KubeRouterConfig
 }
+
+// sharedInformers bundles every informer we start so that we can hand a single value to each controller.
+// Each controller declares its own narrow interface over this (routing.Informers, proxy.Informers, and so on)
+// and therefore only ever sees the informers it actually watches.
+type sharedInformers struct {
+	services        cache.SharedIndexInformer
+	endpointSlices  cache.SharedIndexInformer
+	pods            cache.SharedIndexInformer
+	nodes           cache.SharedIndexInformer
+	namespaces      cache.SharedIndexInformer
+	networkPolicies cache.SharedIndexInformer
+}
+
+func (s *sharedInformers) Services() cache.SharedIndexInformer        { return s.services }
+func (s *sharedInformers) EndpointSlices() cache.SharedIndexInformer  { return s.endpointSlices }
+func (s *sharedInformers) Pods() cache.SharedIndexInformer            { return s.pods }
+func (s *sharedInformers) Nodes() cache.SharedIndexInformer           { return s.nodes }
+func (s *sharedInformers) Namespaces() cache.SharedIndexInformer      { return s.namespaces }
+func (s *sharedInformers) NetworkPolicies() cache.SharedIndexInformer { return s.networkPolicies }
 
 // NewKubeRouterDefault returns a KubeRouter object
 func NewKubeRouterDefault(config *options.KubeRouterConfig) (*KubeRouter, error) {
@@ -41,31 +68,51 @@ func NewKubeRouterDefault(config *options.KubeRouterConfig) (*KubeRouter, error)
 	var err error
 	version.PrintVersion(true)
 	version.PrintVersionMessages(true)
-	// Use out of cluster config if the URL or kubeconfig have been specified. Otherwise use incluster config.
-	if len(config.Master) != 0 || len(config.Kubeconfig) != 0 {
+	// Use out of cluster config if the kubeconfig has been specified. Otherwise use incluster config.
+	//nolint:gocritic // An if-elseif-else is more readable than a switch in this case.
+	if len(config.Kubeconfig) != 0 {
 		clientconfig, err = clientcmd.BuildConfigFromFlags(config.Master, config.Kubeconfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to build configuration from CLI: %v", err)
+			return nil, fmt.Errorf("failed to build configuration from CLI: %w", err)
 		}
+	} else if len(config.Master) != 0 {
+		// InClusterConfig() fails with ErrNotInCluster if these are unset.
+		os.Setenv("KUBERNETES_SERVICE_HOST", " ")
+		os.Setenv("KUBERNETES_SERVICE_PORT", " ")
+
+		clientconfig, err = rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("unable to initialize inclusterconfig: %w", err)
+		}
+
+		os.Setenv("KUBERNETES_SERVICE_HOST", "")
+		os.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+		clientconfig.Host = config.Master
 	} else {
 		clientconfig, err = rest.InClusterConfig()
 		if err != nil {
-			return nil, fmt.Errorf("unable to initialize inclusterconfig: %v", err)
+			return nil, fmt.Errorf("unable to initialize inclusterconfig: %w", err)
 		}
 	}
 
 	clientset, err := kubernetes.NewForConfig(clientconfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Kubernetes client: %v", err)
+		return nil, fmt.Errorf("failed to create Kubernetes client: %w", err)
 	}
 
 	return &KubeRouter{Client: clientset, Config: config}, nil
 }
 
 // CleanupConfigAndExit performs Cleanup on all three controllers
-func CleanupConfigAndExit() {
-	npc := netpol.NetworkPolicyController{}
-	npc.Cleanup()
+func CleanupConfigAndExit(config *options.KubeRouterConfig) {
+	if config != nil && config.UseNftablesForNetpol {
+		npc := netpol.NetworkPolicyControllerNftables{NetworkPolicyControllerBase: &netpol.NetworkPolicyControllerBase{}}
+		npc.Cleanup()
+	} else {
+		npc := netpol.NetworkPolicyControllerIptables{NetworkPolicyControllerBase: &netpol.NetworkPolicyControllerBase{}}
+		npc.Cleanup()
+	}
 
 	nsc := proxy.NetworkServicesController{}
 	nsc.Cleanup()
@@ -80,7 +127,7 @@ func (kr *KubeRouter) Run() error {
 	var ipsetMutex sync.Mutex
 	var wg sync.WaitGroup
 
-	if !(kr.Config.RunFirewall || kr.Config.RunServiceProxy || kr.Config.RunRouter) {
+	if !kr.Config.RunFirewall && !kr.Config.RunServiceProxy && !kr.Config.RunRouter {
 		klog.Info("Router, Firewall or Service proxy functionality must be specified. Exiting!")
 		os.Exit(0)
 	}
@@ -89,26 +136,45 @@ func (kr *KubeRouter) Run() error {
 	defer close(healthChan)
 	stopCh := make(chan struct{})
 
+	// Verify the health address/port combo provided is listenable
+	if err := utils.TCPAddressBindable(kr.Config.HealthAddr, kr.Config.HealthPort); err != nil {
+		return fmt.Errorf("failed to listen on %s:%d for heath controller: %w",
+			kr.Config.HealthAddr,
+			int(kr.Config.HealthPort),
+			err)
+	}
+
 	hc, err := healthcheck.NewHealthController(kr.Config)
 	if err != nil {
-		return fmt.Errorf("failed to create health controller: %v", err)
+		return fmt.Errorf("failed to create health controller: %w", err)
 	}
 	wg.Add(1)
 	go hc.RunServer(stopCh, &wg)
 
+	// Setup factory and informers
 	informerFactory := informers.NewSharedInformerFactory(kr.Client, 0)
-	svcInformer := informerFactory.Core().V1().Services().Informer()
-	epInformer := informerFactory.Core().V1().Endpoints().Informer()
-	epSliceInformer := informerFactory.Discovery().V1().EndpointSlices().Informer()
-	podInformer := informerFactory.Core().V1().Pods().Informer()
-	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
-	nsInformer := informerFactory.Core().V1().Namespaces().Informer()
-	npInformer := informerFactory.Networking().V1().NetworkPolicies().Informer()
+	krInformers := &sharedInformers{
+		services:        informerFactory.Core().V1().Services().Informer(),
+		endpointSlices:  informerFactory.Discovery().V1().EndpointSlices().Informer(),
+		pods:            informerFactory.Core().V1().Pods().Informer(),
+		nodes:           informerFactory.Core().V1().Nodes().Informer(),
+		namespaces:      informerFactory.Core().V1().Namespaces().Informer(),
+		networkPolicies: informerFactory.Networking().V1().NetworkPolicies().Informer(),
+	}
+
+	// Add custom indexers
+	err = krInformers.EndpointSlices().AddIndexers(map[string]cache.IndexFunc{
+		indexers.ServiceNameIndex: indexers.ServiceNameIndexFunc,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to add indexers to endpoint slice informer: %w", err)
+	}
+
 	informerFactory.Start(stopCh)
 
 	err = kr.CacheSyncOrTimeout(informerFactory, stopCh)
 	if err != nil {
-		return fmt.Errorf("failed to synchronize cache: %v", err)
+		return fmt.Errorf("failed to synchronize cache: %w", err)
 	}
 
 	hc.SetAlive()
@@ -128,7 +194,7 @@ func (kr *KubeRouter) Run() error {
 		kr.Config.MetricsEnabled = true
 		mc, err := metrics.NewMetricsController(kr.Config)
 		if err != nil {
-			return fmt.Errorf("failed to create metrics controller: %v", err)
+			return fmt.Errorf("failed to create metrics controller: %w", err)
 		}
 		wg.Add(1)
 		go mc.Run(healthChan, stopCh, &wg)
@@ -156,24 +222,24 @@ func (kr *KubeRouter) Run() error {
 		}
 	}
 
+	ipValidator, err := svcip.NewValidator(svcip.Config{
+		ExternalIPCIDRs:   kr.Config.ExternalIPCIDRs,
+		LoadBalancerCIDRs: kr.Config.LoadBalancerCIDRs,
+		ClusterIPCIDRs:    kr.Config.ClusterIPCIDRs,
+		StrictValidation:  kr.Config.StrictExternalIPValidation,
+		EnableIPv4:        kr.Config.EnableIPv4,
+		EnableIPv6:        kr.Config.EnableIPv6,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create service IP validator: %w", err)
+	}
+	ipValidator.LogStatus()
+
 	if kr.Config.RunRouter {
 		nrc, err := routing.NewNetworkRoutingController(kr.Client, kr.Config,
-			nodeInformer, svcInformer, epInformer, &ipsetMutex)
+			krInformers, &ipsetMutex, ipValidator)
 		if err != nil {
-			return fmt.Errorf("failed to create network routing controller: %v", err)
-		}
-
-		_, err = nodeInformer.AddEventHandler(nrc.NodeEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add NodeEventHandler: %v", err)
-		}
-		_, err = svcInformer.AddEventHandler(nrc.ServiceEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add ServiceEventHandler: %v", err)
-		}
-		_, err = epInformer.AddEventHandler(nrc.EndpointsEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add EndpointsEventHandler: %v", err)
+			return fmt.Errorf("failed to create network routing controller: %w", err)
 		}
 
 		wg.Add(1)
@@ -189,18 +255,9 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.RunServiceProxy {
 		nsc, err := proxy.NewNetworkServicesController(kr.Client, kr.Config,
-			svcInformer, epSliceInformer, podInformer, &ipsetMutex)
+			krInformers, &ipsetMutex, ipValidator)
 		if err != nil {
-			return fmt.Errorf("failed to create network services controller: %v", err)
-		}
-
-		_, err = svcInformer.AddEventHandler(nsc.ServiceEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add ServiceEventHandler: %v", err)
-		}
-		_, err = epSliceInformer.AddEventHandler(nsc.EndpointSliceEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add EndpointsEventHandler: %v", err)
+			return fmt.Errorf("failed to create network services controller: %w", err)
 		}
 
 		wg.Add(1)
@@ -215,27 +272,26 @@ func (kr *KubeRouter) Run() error {
 	}
 
 	if kr.Config.RunFirewall {
-		iptablesCmdHandlers, ipSetHandlers, err := netpol.NewIPTablesHandlers(kr.Config)
+		var iptablesCmdHandlers map[v1core.IPFamily]utils.IPTablesHandler
+		var ipSetHandlers map[v1core.IPFamily]utils.IPSetHandler
+		if !kr.Config.UseNftablesForNetpol {
+			var err error
+			iptablesCmdHandlers, ipSetHandlers, err = netpol.NewIPTablesHandlers(kr.Config)
+			if err != nil {
+				return fmt.Errorf("failed to create iptables handlers: %w", err)
+			}
+		}
+		nftCtx, nftCancel := context.WithTimeout(context.Background(), nftablesInitTimeout)
+		knftablesInterfaces, err := netpol.NewKnftablesInterfaces(nftCtx, kr.Config)
+		nftCancel()
 		if err != nil {
-			return fmt.Errorf("failed to create iptables handlers: %v", err)
+			return fmt.Errorf("failed to create nftables interfaces: %v", err)
 		}
 		npc, err := netpol.NewNetworkPolicyController(kr.Client,
-			kr.Config, podInformer, npInformer, nsInformer, &ipsetMutex, iptablesCmdHandlers, ipSetHandlers)
+			kr.Config, krInformers, &ipsetMutex, nil,
+			iptablesCmdHandlers, ipSetHandlers, ipValidator, knftablesInterfaces)
 		if err != nil {
-			return fmt.Errorf("failed to create network policy controller: %v", err)
-		}
-
-		_, err = podInformer.AddEventHandler(npc.PodEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add PodEventHandler: %v", err)
-		}
-		_, err = nsInformer.AddEventHandler(npc.NamespaceEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add NamespaceEventHandler: %v", err)
-		}
-		_, err = npInformer.AddEventHandler(npc.NetworkPolicyEventHandler)
-		if err != nil {
-			return fmt.Errorf("failed to add NetworkPolicyEventHandler: %v", err)
+			return fmt.Errorf("failed to create network policy controller: %w", err)
 		}
 
 		wg.Add(1)
@@ -244,14 +300,9 @@ func (kr *KubeRouter) Run() error {
 
 	if kr.Config.RunLoadBalancer {
 		klog.V(0).Info("running load balancer allocator controller")
-		lbc, err := lballoc.NewLoadBalancerController(kr.Client, kr.Config, svcInformer)
+		lbc, err := lballoc.NewLoadBalancerController(kr.Client, kr.Config, krInformers, ipValidator)
 		if err != nil {
-			return fmt.Errorf("failed to create load balancer allocator: %v", err)
-		}
-
-		_, err = svcInformer.AddEventHandler(lbc)
-		if err != nil {
-			return fmt.Errorf("failed to add ServiceEventHandler: %v", err)
+			return fmt.Errorf("failed to create load balancer allocator: %w", err)
 		}
 
 		wg.Add(1)

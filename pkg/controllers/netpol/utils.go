@@ -95,7 +95,7 @@ func getIPsFromPods(pods []podInfo, family api.IPFamily) []string {
 	return ips
 }
 
-func (npc *NetworkPolicyController) createGenericHashIPSet(
+func (npc *NetworkPolicyControllerIptables) createGenericHashIPSet(
 	ipsetName, hashType string, ips []string, ipFamily api.IPFamily) {
 	setEntries := make([][]string, 0)
 	for _, ip := range ips {
@@ -105,19 +105,20 @@ func (npc *NetworkPolicyController) createGenericHashIPSet(
 }
 
 // createPolicyIndexedIPSet creates a policy based ipset and indexes it as an active ipset
-func (npc *NetworkPolicyController) createPolicyIndexedIPSet(
+func (npc *NetworkPolicyControllerIptables) createPolicyIndexedIPSet(
 	activePolicyIPSets map[string]bool, ipsetName, hashType string, ips []string, ipFamily api.IPFamily) {
 	activePolicyIPSets[ipsetName] = true
 	npc.createGenericHashIPSet(ipsetName, hashType, ips, ipFamily)
 }
 
 // createPodWithPortPolicyRule handles the case where port details are provided by the ingress/egress rule and creates
-// an iptables rule that matches on both the source/dest IPs and the port
-func (npc *NetworkPolicyController) createPodWithPortPolicyRule(ports []protocolAndPort,
-	policy networkPolicyInfo, policyName string, srcSetName string, dstSetName string, ipFamily api.IPFamily) error {
+// an iptables rule that matches on both the source/dest IPs and the port. kind is the comment tag for the rule's
+// direction (cmtIngressPods or cmtEgressPods).
+func (npc *NetworkPolicyControllerIptables) createPodWithPortPolicyRule(ports []protocolAndPort,
+	policy networkPolicyInfo, policyName string, srcSetName string, dstSetName string, ipFamily api.IPFamily,
+	kind string) error {
 	for _, portProtocol := range ports {
-		comment := "rule to ACCEPT traffic from source pods to dest pods selected by policy name " +
-			policy.name + " namespace " + policy.namespace
+		comment := polRuleComment(policy, kind)
 		if err := npc.appendRuleToPolicyChain(policyName, comment, srcSetName, dstSetName, portProtocol.protocol,
 			portProtocol.port, portProtocol.endport, ipFamily); err != nil {
 			return err

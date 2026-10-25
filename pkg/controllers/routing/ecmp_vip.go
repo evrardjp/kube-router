@@ -1,20 +1,18 @@
 package routing
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 
-	"golang.org/x/exp/maps"
-
-	"google.golang.org/protobuf/types/known/anypb"
-
+	"github.com/cloudnativelabs/kube-router/v2/pkg/k8s/indexers"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 
-	gobgpapi "github.com/osrg/gobgp/v3/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
 	v1core "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/klog/v2"
@@ -22,109 +20,95 @@ import (
 
 // bgpAdvertiseVIP advertises the service vip (cluster ip or load balancer ip or external IP) the configured peers
 func (nrc *NetworkRoutingController) bgpAdvertiseVIP(vip string) error {
-	subnet, nh, afiFamily, err := nrc.getBGPRouteInfoForVIP(vip)
+	path, err := getBGPPathForVIP(vip, nrc.krNode, false)
 	if err != nil {
-		return fmt.Errorf("unable to advertise VIP because of: %v", err)
+		return fmt.Errorf("unable to advertise VIP: %w", err)
 	}
 
-	klog.V(2).Infof("Advertising route: '%s/%d via %s' to peers", vip, subnet, nh)
+	klog.V(2).Infof("Advertising route: '%s' to peers", vip)
 
-	a1, _ := anypb.New(&gobgpapi.OriginAttribute{
-		Origin: 0,
+	// Add the path using v4 API
+	responses, err := nrc.bgpServer.AddPath(apiutil.AddPathRequest{
+		Paths: []*apiutil.Path{path},
 	})
-	a2, _ := anypb.New(&gobgpapi.NextHopAttribute{
-		NextHop: nh,
-	})
-	attrs := []*anypb.Any{a1, a2}
-	nlri1, _ := anypb.New(&gobgpapi.IPAddressPrefix{
-		Prefix:    vip,
-		PrefixLen: subnet,
-	})
-	_, err = nrc.bgpServer.AddPath(context.Background(), &gobgpapi.AddPathRequest{
-		Path: &gobgpapi.Path{
-			Family: &gobgpapi.Family{Afi: afiFamily, Safi: gobgpapi.Family_SAFI_UNICAST},
-			Nlri:   nlri1,
-			Pattrs: attrs,
-		},
-	})
+	if err != nil {
+		return err
+	}
+	if len(responses) > 0 && responses[0].Error != nil {
+		return responses[0].Error
+	}
 
 	if nrc.MetricsEnabled {
 		metrics.ControllerBGPadvertisementsSent.WithLabelValues("advertise-vip").Inc()
 	}
 
-	return err
+	return nil
 }
 
 // bgpWithdrawVIP  un-advertises the service vip
 func (nrc *NetworkRoutingController) bgpWithdrawVIP(vip string) error {
-	subnet, nh, afiFamily, err := nrc.getBGPRouteInfoForVIP(vip)
+	path, err := getBGPPathForVIP(vip, nrc.krNode, true)
 	if err != nil {
-		return fmt.Errorf("unable to advertise VIP because of: %v", err)
+		return fmt.Errorf("unable to withdraw VIP: %w", err)
 	}
 
-	klog.V(2).Infof("Withdrawing route: '%s/%d via %s' to peers", vip, subnet, nh)
+	klog.V(2).Infof("Withdrawing route: '%s' to peers", vip)
 
-	a1, _ := anypb.New(&gobgpapi.OriginAttribute{
-		Origin: 0,
+	// Delete the path using v4 API
+	err = nrc.bgpServer.DeletePath(apiutil.DeletePathRequest{
+		Paths: []*apiutil.Path{path},
 	})
-	a2, _ := anypb.New(&gobgpapi.NextHopAttribute{
-		NextHop: nh,
-	})
-	attrs := []*anypb.Any{a1, a2}
-	nlri, _ := anypb.New(&gobgpapi.IPAddressPrefix{
-		Prefix:    vip,
-		PrefixLen: subnet,
-	})
-	path := gobgpapi.Path{
-		Family: &gobgpapi.Family{Afi: afiFamily, Safi: gobgpapi.Family_SAFI_UNICAST},
-		Nlri:   nlri,
-		Pattrs: attrs,
+	if err != nil {
+		return err
 	}
-	err = nrc.bgpServer.DeletePath(context.Background(), &gobgpapi.DeletePathRequest{
-		TableType: gobgpapi.TableType_GLOBAL,
-		Path:      &path,
-	})
 
 	if nrc.MetricsEnabled {
 		metrics.ControllerBGPadvertisementsSent.WithLabelValues("withdraw-vip").Inc()
 	}
 
-	return err
+	return nil
 }
 
-func (nrc *NetworkRoutingController) advertiseVIPs(vips []string) {
+// advertiseVIPs advertises every VIP it is given and returns the failures joined together
+func (nrc *NetworkRoutingController) advertiseVIPs(vips []string) error {
+	var advertiseErr error
 	for _, vip := range vips {
 		err := nrc.bgpAdvertiseVIP(vip)
 		if err != nil {
 			klog.Errorf("error advertising IP: %q, error: %v", vip, err)
+			advertiseErr = errors.Join(advertiseErr, fmt.Errorf("advertise %s: %w", vip, err))
 		}
 	}
+	return advertiseErr
 }
 
-func (nrc *NetworkRoutingController) withdrawVIPs(vips []string) {
+func (nrc *NetworkRoutingController) withdrawVIPs(vips []string) error {
+	var withdrawErr error
 	for _, vip := range vips {
 		err := nrc.bgpWithdrawVIP(vip)
 		if err != nil {
 			klog.Errorf("error withdrawing IP: %q, error: %v", vip, err)
+			withdrawErr = errors.Join(withdrawErr, fmt.Errorf("withdraw %s: %w", vip, err))
 		}
 	}
+	return withdrawErr
 }
 
 func (nrc *NetworkRoutingController) newServiceEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			nrc.OnServiceCreate(obj)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			nrc.OnServiceUpdate(oldObj, newObj)
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			nrc.OnServiceDelete(obj)
 		},
 	}
 }
 
-func getServiceObject(obj interface{}) (svc *v1core.Service) {
+func getServiceObject(obj any) (svc *v1core.Service) {
 	if obj == nil {
 		return
 	}
@@ -135,8 +119,9 @@ func getServiceObject(obj interface{}) (svc *v1core.Service) {
 }
 
 func (nrc *NetworkRoutingController) handleServiceUpdate(svcOld, svcNew *v1core.Service) {
-	if !nrc.bgpServerStarted {
-		klog.V(3).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync",
+	klog.V(2).Infof("Handling update for service: %s", svcNew)
+	if !nrc.bgpServerStarted.Load() {
+		klog.V(1).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync",
 			svcNew.Namespace, svcNew.Name)
 		return
 	}
@@ -153,14 +138,16 @@ func (nrc *NetworkRoutingController) handleServiceUpdate(svcOld, svcNew *v1core.
 		klog.Errorf("Error adding BGP policies: %s", err.Error())
 	}
 
-	nrc.advertiseVIPs(toAdvertise)
-	nrc.withdrawVIPs(toWithdraw)
+	// Event-driven, so the periodic sync in Run() owns retrying and reporting this
+	if err := errors.Join(nrc.advertiseVIPs(toAdvertise), nrc.withdrawVIPs(toWithdraw)); err != nil {
+		klog.Errorf("error updating VIPs on service update: %v", err)
+	}
 }
 
 func (nrc *NetworkRoutingController) handleServiceDelete(oldSvc *v1core.Service) {
-
-	if !nrc.bgpServerStarted {
-		klog.V(3).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync",
+	klog.V(2).Infof("Handling delete for service: %s", oldSvc)
+	if !nrc.bgpServerStarted.Load() {
+		klog.V(1).Infof("Skipping update to service: %s/%s, controller still performing bootup full-sync",
 			oldSvc.Namespace, oldSvc.Name)
 		return
 	}
@@ -187,14 +174,16 @@ func (nrc *NetworkRoutingController) handleServiceDelete(oldSvc *v1core.Service)
 	withdrawVIPs := make([]string, 0)
 	for _, serviceVIP := range allIPList {
 		// withdraw VIP only if deleted service is the last service using the VIP
-		if !utils.SliceContainsString(serviceVIP, activeVIPs) {
+		if !slices.Contains(activeVIPs, serviceVIP) {
 			withdrawVIPs = append(withdrawVIPs, serviceVIP)
 		}
 	}
-	nrc.withdrawVIPs(withdrawVIPs)
+	if err := nrc.withdrawVIPs(withdrawVIPs); err != nil {
+		klog.Errorf("error withdrawing VIPs on delete of service %s/%s: %v", oldSvc.Namespace, oldSvc.Name, err)
+	}
 }
 
-func (nrc *NetworkRoutingController) tryHandleServiceUpdate(objOld, objNew interface{}) {
+func (nrc *NetworkRoutingController) tryHandleServiceUpdate(objOld, objNew any) {
 	svcOld := getServiceObject(objOld)
 	svcNew := getServiceObject(objNew)
 
@@ -218,7 +207,7 @@ func (nrc *NetworkRoutingController) tryHandleServiceUpdate(objOld, objNew inter
 	nrc.handleServiceUpdate(svcOld, svcNew)
 }
 
-func (nrc *NetworkRoutingController) tryHandleServiceDelete(oldObj interface{}, logMsgFormat string) {
+func (nrc *NetworkRoutingController) tryHandleServiceDelete(oldObj any, logMsgFormat string) {
 	oldSvc, ok := oldObj.(*v1core.Service)
 	if !ok {
 		tombstone, ok := oldObj.(cache.DeletedFinalStateUnknown)
@@ -243,29 +232,29 @@ func (nrc *NetworkRoutingController) tryHandleServiceDelete(oldObj interface{}, 
 }
 
 // OnServiceCreate handles new service create event from the kubernetes API server
-func (nrc *NetworkRoutingController) OnServiceCreate(obj interface{}) {
+func (nrc *NetworkRoutingController) OnServiceCreate(obj any) {
 	nrc.tryHandleServiceUpdate(nil, obj)
 }
 
 // OnServiceUpdate handles the service relates updates from the kubernetes API server
-func (nrc *NetworkRoutingController) OnServiceUpdate(objOld interface{}, objNew interface{}) {
+func (nrc *NetworkRoutingController) OnServiceUpdate(objOld any, objNew any) {
 	nrc.tryHandleServiceUpdate(objOld, objNew)
 }
 
 // OnServiceDelete handles the service delete updates from the kubernetes API server
-func (nrc *NetworkRoutingController) OnServiceDelete(oldObj interface{}) {
+func (nrc *NetworkRoutingController) OnServiceDelete(oldObj any) {
 	nrc.tryHandleServiceDelete(oldObj, "Received event to delete service: %s/%s from watch API")
 }
 
-func (nrc *NetworkRoutingController) newEndpointsEventHandler() cache.ResourceEventHandler {
+func (nrc *NetworkRoutingController) newEndpointSliceEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			nrc.OnEndpointsAdd(obj)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			nrc.OnEndpointsUpdate(newObj)
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			// don't do anything if an endpoints resource is deleted since
 			// the service delete event handles route withdrawals
 		},
@@ -277,8 +266,8 @@ func (nrc *NetworkRoutingController) newEndpointsEventHandler() cache.ResourceEv
 // Calling AddPolicies here covers the edge case where AddPolicies fails in
 // OnServiceUpdate because the corresponding Endpoint resource for the
 // Service was not created yet.
-func (nrc *NetworkRoutingController) OnEndpointsAdd(obj interface{}) {
-	if !nrc.bgpServerStarted {
+func (nrc *NetworkRoutingController) OnEndpointsAdd(obj any) {
+	if !nrc.bgpServerStarted.Load() {
 		klog.V(3).Info("Skipping OnAdd event to endpoint, controller still performing bootup full-sync")
 		return
 	}
@@ -287,31 +276,31 @@ func (nrc *NetworkRoutingController) OnEndpointsAdd(obj interface{}) {
 }
 
 // OnEndpointsUpdate handles the endpoint updates from the kubernetes API server
-func (nrc *NetworkRoutingController) OnEndpointsUpdate(obj interface{}) {
-	ep, ok := obj.(*v1core.Endpoints)
+func (nrc *NetworkRoutingController) OnEndpointsUpdate(obj any) {
+	ep, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
-		klog.Errorf("cache indexer returned obj that is not type *v1.Endpoints")
+		klog.Errorf("cache indexer returned obj that is not type *discoveryv1.EndpointSlice")
 		return
 	}
 
-	if isEndpointsForLeaderElection(ep) {
+	if isEndpointSliceForLeaderElection(ep) {
 		return
 	}
 
-	klog.V(1).Infof("Received update to endpoint: %s/%s from watch API", ep.Namespace, ep.Name)
-	if !nrc.bgpServerStarted {
-		klog.V(3).Infof("Skipping update to endpoint: %s/%s, controller still performing bootup full-sync",
+	klog.V(1).Infof("Received update to endpoint slice: %s/%s from watch API", ep.Namespace, ep.Name)
+	if !nrc.bgpServerStarted.Load() {
+		klog.V(3).Infof("Skipping update to endpoint slice: %s/%s, controller still performing bootup full-sync",
 			ep.Namespace, ep.Name)
 		return
 	}
 
-	svc, exists, err := utils.ServiceForEndpoints(&nrc.svcLister, ep)
+	svc, exists, err := utils.ServiceForEndpointSlice(&nrc.svcLister, ep)
 	if err != nil {
-		klog.Errorf("failed to convert endpoints resource to service: %s", err)
+		klog.Errorf("failed to convert endpoint slice resource to service: %s", err)
 		return
 	}
 
-	// ignore updates to Endpoints object with no corresponding Service object
+	// ignore updates to EndpointSlice object with no corresponding Service object
 	if !exists {
 		return
 	}
@@ -328,13 +317,7 @@ func (nrc *NetworkRoutingController) getClusterIP(svc *v1core.Service) []string 
 			clusterIPList = append(clusterIPList, svc.Spec.ClusterIPs...)
 			// check to ensure ClusterIP is contained within ClusterIPs - This should always be the case, but we check
 			// just to make extra sure
-			clusterIPFound := false
-			for _, clusterIP := range clusterIPList {
-				if svc.Spec.ClusterIP == clusterIP {
-					clusterIPFound = true
-					break
-				}
-			}
+			clusterIPFound := slices.Contains(clusterIPList, svc.Spec.ClusterIP)
 			if !clusterIPFound {
 				clusterIPList = append(clusterIPList, svc.Spec.ClusterIP)
 			}
@@ -352,6 +335,9 @@ func (nrc *NetworkRoutingController) getExternalIPs(svc *v1core.Service) []strin
 			externalIPList = append(externalIPList, svc.Spec.ExternalIPs...)
 		}
 	}
+	if nrc.ipFilter != nil {
+		externalIPList = nrc.ipFilter.FilterExternalIPs(externalIPList, svc.Name, svc.Namespace)
+	}
 	return externalIPList
 }
 
@@ -361,11 +347,14 @@ func (nrc *NetworkRoutingController) getLoadBalancerIPs(svc *v1core.Service) []s
 		// skip headless services
 		if !utils.ClusterIPIsNoneOrBlank(svc.Spec.ClusterIP) {
 			for _, lbIngress := range svc.Status.LoadBalancer.Ingress {
-				if len(lbIngress.IP) > 0 {
+				if len(lbIngress.IP) > 0 && (lbIngress.IPMode == nil || *lbIngress.IPMode != v1core.LoadBalancerIPModeProxy) {
 					loadBalancerIPList = append(loadBalancerIPList, lbIngress.IP)
 				}
 			}
 		}
+	}
+	if nrc.ipFilter != nil {
+		loadBalancerIPList = nrc.ipFilter.FilterLoadBalancerIPs(loadBalancerIPList, svc.Name, svc.Namespace)
 	}
 	return loadBalancerIPList
 }
@@ -409,7 +398,7 @@ func (nrc *NetworkRoutingController) getChangedVIPs(oldSvc, newSvc *v1core.Servi
 	toAdvertiseListFinal := newAdvertiseServiceVIPs
 	toWithdrawList := newUnadvertiseServiceVIPs
 	for _, oldServiceVIP := range oldAllServiceVIPs {
-		if !utils.SliceContainsString(oldServiceVIP, toAdvertiseListFinal) {
+		if !slices.Contains(toAdvertiseListFinal, oldServiceVIP) {
 			toWithdrawList = append(toWithdrawList, oldServiceVIP)
 		}
 	}
@@ -422,7 +411,7 @@ func (nrc *NetworkRoutingController) getChangedVIPs(oldSvc, newSvc *v1core.Servi
 		return nil, nil, err
 	}
 	for _, withdrawVIP := range toWithdrawList {
-		if !utils.SliceContainsString(withdrawVIP, allVIPsOnServer) {
+		if !slices.Contains(allVIPsOnServer, withdrawVIP) {
 			toWithdrawListFinal = append(toWithdrawListFinal, withdrawVIP)
 		}
 	}
@@ -456,7 +445,7 @@ func (nrc *NetworkRoutingController) getVIPs() ([]string, []string, error) {
 	// one active endpoint on the node, or we might introduce a service disruption.
 	finalToWithdrawList := make([]string, 0)
 	for _, withdrawVIP := range toWithdrawList {
-		if !utils.SliceContainsString(withdrawVIP, toAdvertiseList) {
+		if !slices.Contains(toAdvertiseList, withdrawVIP) {
 			finalToWithdrawList = append(finalToWithdrawList, withdrawVIP)
 		}
 	}
@@ -485,7 +474,7 @@ func (nrc *NetworkRoutingController) shouldAdvertiseService(svc *v1core.Service,
 
 	// If:
 	// - We are assessing the clusterIP of the service (the internally facing VIP)
-	// - The service has an internal traffic policy of "local" or the service has the service.local annotation on it
+	// - The service has an internal traffic policy of "local"
 	// - The service doesn't have any endpoints on the node we're executing on
 	// Then: return false
 	// We handle spec.internalTrafficPolicy different because it was introduced in v1.26 and may not be available in all
@@ -494,8 +483,7 @@ func (nrc *NetworkRoutingController) shouldAdvertiseService(svc *v1core.Service,
 	if svc.Spec.InternalTrafficPolicy != nil {
 		serIntTrafPol = *svc.Spec.InternalTrafficPolicy == v1core.ServiceInternalTrafficPolicyLocal
 	}
-	intLocalPol := (serIntTrafPol || svc.Annotations[svcLocalAnnotation] == "true")
-	if isClusterIP && intLocalPol && !hasLocalEndpoints {
+	if isClusterIP && serIntTrafPol && !hasLocalEndpoints {
 		return false, nil
 	}
 
@@ -566,57 +554,44 @@ func (nrc *NetworkRoutingController) getAllVIPsForService(svc *v1core.Service) (
 
 }
 
-func isEndpointsForLeaderElection(ep *v1core.Endpoints) bool {
+func isEndpointSliceForLeaderElection(ep *discoveryv1.EndpointSlice) bool {
 	_, isLeaderElection := ep.Annotations[resourcelock.LeaderElectionRecordAnnotationKey]
 	return isLeaderElection
 }
 
-// nodeHasEndpointsForService will get the corresponding Endpoints resource for a given Service
+// nodeHasEndpointsForService will get the corresponding EndpointSlice resource for a given Service
 // return true if any endpoint addresses has NodeName matching the node name of the route controller
 func (nrc *NetworkRoutingController) nodeHasEndpointsForService(svc *v1core.Service) (bool, error) {
-	// listers for endpoints and services should use the same keys since
-	// endpoint and service resources share the same object name and namespace
-	key, err := cache.MetaNamespaceKeyFunc(svc)
+	// 1. Construct the lookup key from the Service object.
+	// This key must match the format produced by ServiceNameIndexFunc (see k8s/indexers/endpointslices.go)
+	key := fmt.Sprintf("%s/%s", svc.Namespace, svc.Name)
+
+	slices, err := nrc.epSliceLister.ByIndex(indexers.ServiceNameIndex, key)
 	if err != nil {
 		return false, err
 	}
-	item, exists, err := nrc.epLister.GetByKey(key)
-	if err != nil {
-		return false, err
+
+	if len(slices) == 0 {
+		return false, fmt.Errorf("endpoint slice resource doesn't exist for service: %q", svc.Name)
 	}
 
-	if !exists {
-		return false, fmt.Errorf("endpoint resource doesn't exist for service: %q", svc.Name)
-	}
-
-	ep, ok := item.(*v1core.Endpoints)
-	if !ok {
-		return false, errors.New("failed to convert cache item to Endpoints type")
-	}
-
-	// Find all the IPs that this node has on it so that we can use it to compare it against endpoint IPs
-	allNodeIPs := make([]string, 0)
-	for _, ips := range maps.Values(nrc.nodeIPv4Addrs) {
-		for _, ip := range ips {
-			allNodeIPs = append(allNodeIPs, ip.String())
+	for _, slice := range slices {
+		es, ok := slice.(*discoveryv1.EndpointSlice)
+		if !ok {
+			return false, errors.New("failed to convert cache item to EndpointSlice type")
 		}
-	}
-	for _, ips := range maps.Values(nrc.nodeIPv6Addrs) {
-		for _, ip := range ips {
-			allNodeIPs = append(allNodeIPs, ip.String())
-		}
-	}
 
-	for _, subset := range ep.Subsets {
-		for _, address := range subset.Addresses {
-			if address.NodeName != nil {
-				if *address.NodeName == nrc.nodeName {
+		for _, endpoint := range es.Endpoints {
+			if endpoint.NodeName != nil {
+				if *endpoint.NodeName == nrc.krNode.GetNodeName() {
 					return true, nil
 				}
 			} else {
-				for _, nodeIP := range allNodeIPs {
-					if address.IP == nodeIP {
-						return true, nil
+				for _, address := range endpoint.Addresses {
+					for _, nodeIP := range nrc.krNode.GetNodeIPAddrs() {
+						if address == nodeIP.String() {
+							return true, nil
+						}
 					}
 				}
 			}

@@ -19,14 +19,19 @@ Requirements:
 
 * ClusterIP type service has an externalIP set on it or is a LoadBalancer type service
 * kube-router has been started with `--service-external-ip-range` configured at least once. This option can be
-  specified multiple times for multiple ranges. The external IPs or LoadBalancer IPs must be included in these ranges.
+  specified multiple times for multiple ranges. The external IPs must be included in these ranges. For LoadBalancer
+  IPs, `--loadbalancer-ip-range` must also be configured.
+* With `--strict-external-ip-validation` enabled (the default), these same ranges are used by the proxy module to
+  validate IPs before programming them into IPVS. If you already have `--service-external-ip-range` and
+  `--loadbalancer-ip-range` configured for DSR, no additional configuration is needed.
 * kube-router must be run in service proxy mode with `--run-service-proxy` (this option is defaulted to `true` if left
   unspecified)
 * If you are advertising the service outside the cluster `--advertise-external-ip` must be set
 * If kube-router is deployed as a Kubernetes pod:
   * `hostIPC: true` must be set for the pod
   * `hostPID: true` must be set for the pod
-  * The container runtime socket must be mounted into the kube-router pod via a `hostPath` volume mount.
+  * The container runtime (CRI) socket directory must be mounted into the kube-router pod via a `hostPath` volume mount.
+    We need to mount the entire directory as the socket file might change in case of the container runtime restarts.
   * `/etc/iproute2/rt_tables` (or similar) must be read/write mounted into the kube-router pod via a `hostPath` volume
     mount. NOTE: since v6.5.0 of iproute2 this file has been moved underneath `/usr` in either
     `/usr/lib/iproute2/rt_tables` or `/usr/share/iproute2/rt_tables` instead of in `/etc` so this mount may need to be
@@ -46,6 +51,9 @@ kubectl annotate service my-service "kube-router.io/service.dsr=tunnel"
 ## Things To Lookout For
 
 * In the current implementation, **DSR will only be available to the external IPs or LoadBalancer IPs**
+* When `--strict-external-ip-validation` is enabled (the default), externalIPs and loadBalancerIPs must pass validation
+  against configured CIDR ranges before they can be programmed into IPVS for DSR. Ensure your DSR service IPs are
+  covered by `--service-external-ip-range` and/or `--loadbalancer-ip-range`.
 * **The current implementation does not support port remapping.** So you need to use same port and target port for the
   service.
 * In order for DSR to work correctly, an `ipip` tunnel to the pod is used. This reduces the
@@ -59,63 +67,8 @@ kubectl annotate service my-service "kube-router.io/service.dsr=tunnel"
 
 ## Kubernetes Pod Examples
 
-As mentioned previously, if kube-router is run as a Kubernetes deployment, there are a couple of things needed on the
-deployment. Below is an example of what is necessary to get going (this is NOT a full deployment, it is just meant to
-highlight the elements needed for DSR):
-
-```sh
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  labels:
-    k8s-app: kube-router
-    tier: node
-  name: kube-router
-  namespace: kube-system
-spec:
-  selector:
-    matchLabels:
-      k8s-app: kube-router
-      tier: node
-  template:
-    metadata:
-      labels:
-        k8s-app: kube-router
-        tier: node
-    spec:
-      hostNetwork: true
-      hostIPC: true
-      hostPID: true
-      volumes:
-      - name: run
-        hostPath:
-          path: /var/run/docker.sock
-      - name: rt-tables
-        hostPath:
-          path: /etc/iproute2/rt_tables
-      ...
-      containers:
-      - name: kube-router
-        image: docker.io/cloudnativelabs/kube-router:latest
-        ...
-        volumeMounts:
-        - name: run
-          mountPath: /var/run/docker.sock
-          readOnly: true
-        - name: rt-tables
-          mountPath: /etc/iproute2/rt_tables
-          readOnly: false
-...
-```
-
-For an example manifest please look at the
-[kube-router all features manifest](../daemonset/kubeadm-kuberouter-all-features-dsr.yaml) with DSR requirements for
-Docker enabled.
-
-### DSR with containerd or cri-o
-
-As of kube-router-1.2.X and later, kube-router's DSR mode now works with non-docker container runtimes. Officially only
-containerd has been tested, but this solution should work with cri-o as well.
+As of kube-router-1.2.X and later, kube-router's DSR mode now works with CRI compliant container runtimes.
+Officially only containerd has been tested, but this solution should work with cri-o as well.
 
 Most of what was said above also applies for non-docker container runtimes, however, there are some adjustments that
 you'll need to make:
@@ -139,7 +92,10 @@ spec:
       volumes:
       - name: containerd-sock
         hostPath:
-          path: /run/containerd/containerd.sock
+          path: /run/containerd/
+      - name: rt-tables
+        hostPath:
+          path: /etc/iproute2/rt_tables
       ...
       containers:
       - name: kube-router
@@ -148,14 +104,21 @@ spec:
         ...
         volumeMounts:
         - name: containerd-sock
-          mountPath: /run/containerd/containerd.sock
+          mountPath: /run/containerd/
           readOnly: true
+        - name: rt-tables
+          mountPath: /etc/iproute2/rt_tables
+          readOnly: false
 ...
 ```
 
+For an example manifest please look at the
+[kube-router all features manifest](../daemonset/kubeadm-kuberouter-all-features-dsr.yaml) with DSR requirements for
+containerd enabled.
+
 ## More Details About DSR
 
-In order to facilitate troubleshooting it is worth while to explain how kube-router accomplishes DSR functionality.
+In order to facilitate troubleshooting it is worthwhile to explain how kube-router accomplishes DSR functionality.
 
 1. kube-router adds iptables rules to the `mangle` table which marks incoming packets destined for DSR based services
    with a unique FW mark. This mark is then used in later stages to identify the packet and route it correctly.
@@ -173,7 +136,7 @@ In order to facilitate troubleshooting it is worth while to explain how kube-rou
    encapsulates the incoming packet in an ipip packet. It is at this point that the pod's destination IP is placed on
    the ipip packet header so that a packet can be routed to the pod via the kube-bridge on either this host or the
    destination host.
-6. kube-router then finds the targeted pod and enters it's local network namespace. Once inside the pod's linux network
+6. kube-router then finds the targeted pod and enters its local network namespace. Once inside the pod's linux network
    namespace, it sets up two new interfaces called `kube-dummy-if` and `ipip`. `kube-dummy-if` is configured with the
    externalIP address of the service.
 7. When the ipip packet arrives inside the pod, the original source packet with the externalIP is then extracted from

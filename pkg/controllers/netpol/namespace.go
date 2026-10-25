@@ -8,15 +8,15 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func (npc *NetworkPolicyController) newNamespaceEventHandler() cache.ResourceEventHandler {
+func (npc *NetworkPolicyControllerBase) newNamespaceEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			npc.handleNamespaceAdd(obj.(*api.Namespace))
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			npc.handleNamespaceUpdate(oldObj.(*api.Namespace), newObj.(*api.Namespace))
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			switch obj := obj.(type) {
 			case *api.Namespace:
 				npc.handleNamespaceDelete(obj)
@@ -33,7 +33,7 @@ func (npc *NetworkPolicyController) newNamespaceEventHandler() cache.ResourceEve
 	}
 }
 
-func (npc *NetworkPolicyController) handleNamespaceAdd(obj *api.Namespace) {
+func (npc *NetworkPolicyControllerBase) handleNamespaceAdd(obj *api.Namespace) {
 	if obj.Labels == nil {
 		return
 	}
@@ -42,7 +42,7 @@ func (npc *NetworkPolicyController) handleNamespaceAdd(obj *api.Namespace) {
 	npc.RequestFullSync()
 }
 
-func (npc *NetworkPolicyController) handleNamespaceUpdate(oldObj, newObj *api.Namespace) {
+func (npc *NetworkPolicyControllerBase) handleNamespaceUpdate(oldObj, newObj *api.Namespace) {
 	if reflect.DeepEqual(oldObj.Labels, newObj.Labels) {
 		return
 	}
@@ -51,7 +51,7 @@ func (npc *NetworkPolicyController) handleNamespaceUpdate(oldObj, newObj *api.Na
 	npc.RequestFullSync()
 }
 
-func (npc *NetworkPolicyController) handleNamespaceDelete(obj *api.Namespace) {
+func (npc *NetworkPolicyControllerBase) handleNamespaceDelete(obj *api.Namespace) {
 	if obj.Labels == nil {
 		return
 	}

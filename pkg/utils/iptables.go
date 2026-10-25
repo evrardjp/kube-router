@@ -14,8 +14,28 @@ import (
 
 var hasWait bool
 
+const (
+	ICMPv4Proto = "icmp"
+	ICMPv4Type  = "--icmp-type"
+	ICMPv6Proto = "ipv6-icmp"
+	ICMPv6Type  = "--icmpv6-type"
+
+	icmpTypeDestinationUnreachable = "destination-unreachable"
+
+	icmpEchoRequestComment            = "allow icmp echo requests"
+	icmpDestinationUnreachableComment = "allow icmp destination unreachable messages"
+	icmpTimeExceededComment           = "allow icmp time exceeded messages"
+
+	// NftablesICMPv4Proto and NftablesICMPv6Proto are the protocol names used in nftables rules.
+	// These differ from the iptables names above (e.g. "ipv6-icmp" is iptables-only; nftables uses "icmpv6").
+	NftablesICMPv4Proto = "icmp"
+	NftablesICMPv6Proto = "icmpv6"
+)
+
 // IPTablesHandler interface based on the IPTables struct from github.com/coreos/go-iptables
 // which allows to mock it.
+//
+//go:generate moq -out iptables_moq.go . IPTablesHandler
 type IPTablesHandler interface {
 	Proto() iptables.Protocol
 	Exists(table, chain string, rulespec ...string) (bool, error)
@@ -41,6 +61,19 @@ type IPTablesHandler interface {
 	ChangePolicy(table, chain, target string) error
 	HasRandomFully() bool
 	GetIptablesVersion() (int, int, int)
+}
+
+type ICMPRule struct {
+	IPTablesProto string
+	IPTablesType  string
+	// NftablesProto is the protocol keyword used in nftables rules (e.g. "icmp" or "icmpv6").
+	// It differs from IPTablesProto for IPv6 ("ipv6-icmp" in iptables vs "icmpv6" in nftables).
+	NftablesProto string
+	ICMPType      string
+	// NftablesICMPType is the ICMP type name used in nftables rules. It differs from ICMPType for
+	// some ICMPv6 types (e.g. "neighbor-solicitation" in iptables vs "nd-neighbor-solicit" in nftables).
+	NftablesICMPType string
+	Comment          string
 }
 
 //nolint:gochecknoinits // This is actually a good usage of the init() function
@@ -180,4 +213,51 @@ func (i *IPTablesSaveRestore) Restore(table string, data []byte) error {
 		args = []string{"-T", table}
 	}
 	return i.exec(i.restoreCmd, args, data, nil)
+}
+
+// CommonICMPRules returns a list of common ICMP rules that should always be allowed for given IP family
+func CommonICMPRules(family v1core.IPFamily) []ICMPRule {
+	// Allow various types of ICMP that are important for routing
+	// This first block applies to both IPv4 and IPv6 type rules
+
+	var icmpProto, icmpType string
+	if family == v1core.IPv6Protocol {
+		icmpProto = ICMPv6Proto
+		icmpType = ICMPv6Type
+	} else {
+		icmpProto = ICMPv4Proto
+		icmpType = ICMPv4Type
+	}
+
+	var nftProto string
+	if family == v1core.IPv6Protocol {
+		nftProto = NftablesICMPv6Proto
+	} else {
+		nftProto = NftablesICMPv4Proto
+	}
+
+	icmpRules := []ICMPRule{
+		{icmpProto, icmpType, nftProto, "echo-request", "echo-request", icmpEchoRequestComment},
+		// destination-unreachable here is also responsible for handling / allowing PMTU
+		// (https://en.wikipedia.org/wiki/Path_MTU_Discovery) responses
+		{icmpProto, icmpType, nftProto,
+			"destination-unreachable", icmpTypeDestinationUnreachable, icmpDestinationUnreachableComment},
+		{icmpProto, icmpType, nftProto, "time-exceeded", "time-exceeded", icmpTimeExceededComment},
+	}
+
+	if family == v1core.IPv6Protocol {
+		// Neighbor discovery packets are especially crucial here as without them pods will not communicate properly
+		// over IPv6. Neighbor discovery packets are essentially like ARP for IPv4 which was always allowed under.
+		// previous kube-router versions.
+		// Note: nftables uses different names for ICMPv6 neighbor discovery types than iptables does.
+		icmpRules = append(icmpRules, []ICMPRule{
+			{ICMPv6Proto, ICMPv6Type, NftablesICMPv6Proto,
+				"neighbor-solicitation", "nd-neighbor-solicit", "allow icmp neighbor solicitation messages"},
+			{ICMPv6Proto, ICMPv6Type, NftablesICMPv6Proto,
+				"neighbor-advertisement", "nd-neighbor-advert", "allow icmp neighbor advertisement messages"},
+			{ICMPv6Proto, ICMPv6Type, NftablesICMPv6Proto, "echo-reply", "echo-reply", "allow icmp echo reply messages"},
+		}...)
+	}
+
+	return icmpRules
 }

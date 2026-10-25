@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"reflect"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
-	gobgpapi "github.com/osrg/gobgp/v3/api"
+	"github.com/ccoveille/go-safecast/v2"
+	gobgpapi "github.com/osrg/gobgp/v4/api"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -32,9 +32,11 @@ const (
 	iBGPPeerSet       = "iBGPpeerset"
 	iBGPPeerSetV6     = "iBGPpeersetv6"
 
-	customImportRejectSet = "customimportrejectdefinedset"
-	defaultRouteSet       = "defaultroutedefinedset"
-	defaultRouteSetV6     = "defaultroutedefinedsetv6"
+	customImportRejectSet   = "customimportrejectdefinedset"
+	customImportRejectSetV6 = "customimportrejectdefinedsetv6"
+
+	defaultRouteSet   = "defaultroutedefinedset"
+	defaultRouteSetV6 = "defaultroutedefinedsetv6"
 
 	kubeRouterExportPolicy = "kube_router_export"
 	kubeRouterImportPolicy = "kube_router_import"
@@ -111,7 +113,7 @@ func (nrc *NetworkRoutingController) addPodCidrDefinedSet() error {
 		podCIDRSetV6: nrc.podIPv6CIDRs,
 	} {
 		err := nrc.bgpServer.ListDefinedSet(context.Background(),
-			&gobgpapi.ListDefinedSetRequest{DefinedType: gobgpapi.DefinedType_PREFIX, Name: setName},
+			&gobgpapi.ListDefinedSetRequest{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: setName},
 			func(ds *gobgpapi.DefinedSet) {
 				currentDefinedSet = ds
 			})
@@ -123,7 +125,7 @@ func (nrc *NetworkRoutingController) addPodCidrDefinedSet() error {
 			for _, cidr := range cidrs {
 				_, ipNet, err := net.ParseCIDR(cidr)
 				if err != nil {
-					return fmt.Errorf("couldn't parse CIDR: %s - %v", cidr, err)
+					return fmt.Errorf("couldn't parse CIDR: %s - %w", cidr, err)
 				}
 				cidrLen, _ := ipNet.Mask.Size()
 				var cidrMax int
@@ -135,14 +137,18 @@ func (nrc *NetworkRoutingController) addPodCidrDefinedSet() error {
 				if cidrLen < 0 || cidrLen > cidrMax {
 					return fmt.Errorf("the pod CIDR IP given is not a proper mask: %d", cidrLen)
 				}
+				uCIDRLen, err := safecast.Convert[uint32](cidrLen)
+				if err != nil {
+					return fmt.Errorf("failed to convert CIDR length to uint32: %w", err)
+				}
 				prefixes = append(prefixes, &gobgpapi.Prefix{
 					IpPrefix:      cidr,
-					MaskLengthMin: uint32(cidrLen),
-					MaskLengthMax: uint32(cidrLen),
+					MaskLengthMin: uCIDRLen,
+					MaskLengthMax: uCIDRLen,
 				})
 			}
 			podCidrDefinedSet := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_PREFIX,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
 				Name:        setName,
 				Prefixes:    prefixes,
 			}
@@ -163,7 +169,7 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 		serviceVIPsSet:   maxIPv4MaskSize,
 		serviceVIPsSetV6: maxIPv6MaskSize,
 	} {
-		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_PREFIX)
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_DEFINED_TYPE_PREFIX)
 		if err != nil {
 			return err
 		}
@@ -199,7 +205,7 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 		}
 		if currentDefinedSet == nil {
 			clusterIPPrefixSet := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_PREFIX,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
 				Name:        setName,
 				Prefixes:    advIPPrefixList,
 			}
@@ -212,13 +218,15 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 		}
 
 		currentPrefixes := currentDefinedSet.Prefixes
-		sort.SliceStable(advIPPrefixList, func(i, j int) bool {
-			return advIPPrefixList[i].IpPrefix < advIPPrefixList[j].IpPrefix
+		slices.SortStableFunc(advIPPrefixList, func(a, b *gobgpapi.Prefix) int {
+			return strings.Compare(a.IpPrefix, b.IpPrefix)
 		})
-		sort.SliceStable(currentPrefixes, func(i, j int) bool {
-			return currentPrefixes[i].IpPrefix < currentPrefixes[j].IpPrefix
+		slices.SortStableFunc(currentPrefixes, func(a, b *gobgpapi.Prefix) int {
+			return strings.Compare(a.IpPrefix, b.IpPrefix)
 		})
-		if reflect.DeepEqual(advIPPrefixList, currentPrefixes) {
+		if slices.EqualFunc(advIPPrefixList, currentPrefixes, func(a, b *gobgpapi.Prefix) bool {
+			return a.IpPrefix == b.IpPrefix && a.MaskLengthMin == b.MaskLengthMin && a.MaskLengthMax == b.MaskLengthMax
+		}) {
 			continue
 		}
 		toAdd := make([]*gobgpapi.Prefix, 0)
@@ -246,7 +254,7 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 			}
 		}
 		serviceVIPIPPrefixSet := &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_PREFIX,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
 			Name:        setName,
 			Prefixes:    toAdd,
 		}
@@ -256,7 +264,7 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 			return err
 		}
 		serviceVIPIPPrefixSet = &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_PREFIX,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
 			Name:        setName,
 			Prefixes:    toDelete,
 		}
@@ -273,10 +281,10 @@ func (nrc *NetworkRoutingController) addServiceVIPsDefinedSet() error {
 // create a defined set to represent just the host default route
 func (nrc *NetworkRoutingController) addDefaultRouteDefinedSet() error {
 	for setName, defaultRoute := range map[string]string{
-		defaultRouteSet:   "0.0.0.0/0",
-		defaultRouteSetV6: "::/0",
+		defaultRouteSet:   utils.IPv4DefaultRoute,
+		defaultRouteSetV6: utils.IPv6DefaultRoute,
 	} {
-		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_PREFIX)
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_DEFINED_TYPE_PREFIX)
 		if err != nil {
 			return err
 		}
@@ -284,7 +292,7 @@ func (nrc *NetworkRoutingController) addDefaultRouteDefinedSet() error {
 		if currentDefinedSet == nil {
 			cidrLen := 0
 			defaultRouteDefinedSet := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_PREFIX,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
 				Name:        setName,
 				Prefixes: []*gobgpapi.Prefix{
 					{
@@ -304,31 +312,52 @@ func (nrc *NetworkRoutingController) addDefaultRouteDefinedSet() error {
 	return nil
 }
 
-// create a defined set to represent custom annotated routes to be rejected on import
+// create defined sets to represent custom annotated routes to be rejected on import. The annotation
+// (kube-router.io/node.bgp.customimportreject) may contain a mix of IPv4 and IPv6 CIDRs; we split
+// them by family into two defined sets (customImportRejectSet for V4, customImportRejectSetV6 for
+// V6) because a GoBGP defined set cannot mix prefix families ("multiple families" error) and
+// because each family needs the correct MaskLengthMax (32 vs 128) for longest-match behavior.
 func (nrc *NetworkRoutingController) addCustomImportRejectDefinedSet() error {
-	var currentDefinedSet *gobgpapi.DefinedSet
-	currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(customImportRejectSet, gobgpapi.DefinedType_PREFIX)
-	if err != nil {
-		return err
-	}
+	for setName, maxMask := range map[string]uint32{
+		customImportRejectSet:   maxIPv4MaskSize,
+		customImportRejectSetV6: maxIPv6MaskSize,
+	} {
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_DEFINED_TYPE_PREFIX)
+		if err != nil {
+			return err
+		}
+		if currentDefinedSet != nil {
+			continue
+		}
 
-	if currentDefinedSet == nil {
 		prefixes := make([]*gobgpapi.Prefix, 0)
 		for _, ipNet := range nrc.nodeCustomImportRejectIPNets {
-			prefix := new(gobgpapi.Prefix)
-			prefix.IpPrefix = ipNet.String()
+			// Filter prefixes by address family so each defined set only contains entries that
+			// match its family.
+			isV4 := ipNet.IP.To4() != nil
+			if (setName == customImportRejectSet) != isV4 {
+				continue
+			}
 			mask, _ := ipNet.Mask.Size()
-			prefix.MaskLengthMin = uint32(mask)
-			prefix.MaskLengthMax = uint32(ipv4MaskMinBits)
-			prefixes = append(prefixes, prefix)
+			uIntMask, err := safecast.Convert[uint32](mask)
+			if err != nil {
+				return fmt.Errorf("failed to convert mask to uint32: %w", err)
+			}
+			prefixes = append(prefixes, &gobgpapi.Prefix{
+				IpPrefix:      ipNet.String(),
+				MaskLengthMin: uIntMask,
+				MaskLengthMax: maxMask,
+			})
 		}
 		customImportRejectDefinedSet := &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_PREFIX,
-			Name:        customImportRejectSet,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX,
+			Name:        setName,
 			Prefixes:    prefixes,
 		}
-		return nrc.bgpServer.AddDefinedSet(context.Background(),
-			&gobgpapi.AddDefinedSetRequest{DefinedSet: customImportRejectDefinedSet})
+		if err := nrc.bgpServer.AddDefinedSet(context.Background(),
+			&gobgpapi.AddDefinedSetRequest{DefinedSet: customImportRejectDefinedSet}); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -343,15 +372,17 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 	nodes := nrc.nodeLister.List()
 	for _, node := range nodes {
 		nodeObj := node.(*v1core.Node)
-		nodeIP, err := utils.GetPrimaryNodeIP(nodeObj)
+		targetNode, err := utils.NewRemoteKRNode(nodeObj)
 		if err != nil {
 			klog.Errorf("Failed to find a node IP and therefore cannot add internal BGP Peer: %v", err)
 			continue
 		}
-		if nodeIP.To4() != nil {
-			iBGPPeerCIDRs[v1core.IPv4Protocol] = append(iBGPPeerCIDRs[v1core.IPv4Protocol], nodeIP.String()+"/32")
+		if targetNode.GetPrimaryNodeIP().To4() != nil {
+			iBGPPeerCIDRs[v1core.IPv4Protocol] = append(iBGPPeerCIDRs[v1core.IPv4Protocol],
+				targetNode.GetPrimaryNodeIP().String()+"/32")
 		} else {
-			iBGPPeerCIDRs[v1core.IPv6Protocol] = append(iBGPPeerCIDRs[v1core.IPv6Protocol], nodeIP.String()+"/128")
+			iBGPPeerCIDRs[v1core.IPv6Protocol] = append(iBGPPeerCIDRs[v1core.IPv6Protocol],
+				targetNode.GetPrimaryNodeIP().String()+"/128")
 		}
 	}
 
@@ -359,14 +390,14 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 		v1core.IPv4Protocol: iBGPPeerSet,
 		v1core.IPv6Protocol: iBGPPeerSetV6,
 	} {
-		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_NEIGHBOR)
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(setName, gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR)
 		if err != nil {
 			return iBGPPeerCIDRs, err
 		}
 
 		if currentDefinedSet == nil {
 			iBGPPeerNS := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 				Name:        setName,
 				List:        iBGPPeerCIDRs[family],
 			}
@@ -379,9 +410,9 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 		}
 
 		currentCIDRs := currentDefinedSet.List
-		sort.Strings(iBGPPeerCIDRs[family])
-		sort.Strings(currentCIDRs)
-		if reflect.DeepEqual(iBGPPeerCIDRs, currentCIDRs) {
+		slices.Sort(iBGPPeerCIDRs[family])
+		slices.Sort(currentCIDRs)
+		if slices.Equal(iBGPPeerCIDRs[family], currentCIDRs) {
 			continue
 		}
 		toAdd := make([]string, 0)
@@ -409,7 +440,7 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 			}
 		}
 		iBGPPeerNS := &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        setName,
 			List:        toAdd,
 		}
@@ -418,7 +449,7 @@ func (nrc *NetworkRoutingController) addiBGPPeersDefinedSet() (map[v1core.IPFami
 			return iBGPPeerCIDRs, err
 		}
 		iBGPPeerNS = &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        setName,
 			List:        toDelete,
 		}
@@ -451,7 +482,7 @@ func (nrc *NetworkRoutingController) addExternalBGPPeersDefinedSet() (map[v1core
 	for family, extPeerSetName := range map[v1core.IPFamily]string{
 		v1core.IPv4Protocol: externalPeerSet,
 		v1core.IPv6Protocol: externalPeerSetV6} {
-		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(extPeerSetName, gobgpapi.DefinedType_NEIGHBOR)
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(extPeerSetName, gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR)
 		if err != nil {
 			return externalBGPPeerCIDRs, err
 		}
@@ -478,7 +509,7 @@ func (nrc *NetworkRoutingController) addExternalBGPPeersDefinedSet() (map[v1core
 		}
 		if currentDefinedSet == nil {
 			eBGPPeerNS := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 				Name:        extPeerSetName,
 				List:        externalBGPPeerCIDRs[family],
 			}
@@ -501,7 +532,7 @@ func (nrc *NetworkRoutingController) addAllBGPPeersDefinedSet(
 		v1core.IPv4Protocol: allPeerSet,
 		v1core.IPv6Protocol: allPeerSetV6} {
 		var currentDefinedSet *gobgpapi.DefinedSet
-		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(allPeerSetName, gobgpapi.DefinedType_NEIGHBOR)
+		currentDefinedSet, err := nrc.getDefinedSetFromGoBGP(allPeerSetName, gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR)
 		if err != nil {
 			return err
 		}
@@ -510,7 +541,7 @@ func (nrc *NetworkRoutingController) addAllBGPPeersDefinedSet(
 		allBgpPeers := append(externalBGPPeerCIDRs[family], iBGPPeerCIDRs[family]...)
 		if currentDefinedSet == nil {
 			allPeerNS := &gobgpapi.DefinedSet{
-				DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+				DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 				Name:        allPeerSetName,
 				List:        allBgpPeers,
 			}
@@ -547,7 +578,7 @@ func (nrc *NetworkRoutingController) addAllBGPPeersDefinedSet(
 			}
 		}
 		allPeerNS := &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        allPeerSetName,
 			List:        toAdd,
 		}
@@ -556,7 +587,7 @@ func (nrc *NetworkRoutingController) addAllBGPPeersDefinedSet(
 			return err
 		}
 		allPeerNS = &gobgpapi.DefinedSet{
-			DefinedType: gobgpapi.DefinedType_NEIGHBOR,
+			DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR,
 			Name:        allPeerSetName,
 			List:        toDelete,
 		}
@@ -591,7 +622,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 	if nrc.pathPrepend {
 		prependAsn, err := strconv.ParseUint(nrc.pathPrependAS, 10, asnMaxBitSize)
 		if err != nil {
-			return errors.New("Invalid value for kube-router.io/path-prepend.as: " + err.Error())
+			return fmt.Errorf("invalid value for kube-router.io/path-prepend.as: %w", err)
 		}
 		bgpActions = gobgpapi.Actions{
 			AsPrepend: &gobgpapi.AsPrependAction{
@@ -603,13 +634,13 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 
 	if nrc.bgpEnableInternal {
 		actions := gobgpapi.Actions{
-			RouteAction: gobgpapi.RouteAction_ACCEPT,
+			RouteAction: gobgpapi.RouteAction_ROUTE_ACTION_ACCEPT,
 		}
 
 		// statement to represent the export policy to permit advertising node's IPv4 & IPv6 pod CIDRs
 		for _, podSet := range []string{podCIDRSet, podCIDRSetV6} {
 			podSetEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-				{DefinedType: gobgpapi.DefinedType_PREFIX, Name: podSet},
+				{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: podSet},
 			})
 			if err != nil {
 				return err
@@ -622,11 +653,11 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 			statement := gobgpapi.Statement{
 				Conditions: &gobgpapi.Conditions{
 					PrefixSet: &gobgpapi.MatchSet{
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
 						Name: podSet,
 					},
 					NeighborSet: &gobgpapi.MatchSet{
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
 						Name: iBGPPeerSet,
 					},
 				},
@@ -634,7 +665,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 				Name:    podSet + iBGPPeerSet,
 			}
 			if err = nrc.ensureStatementExists(&statement); err != nil {
-				return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
+				return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
 			}
 			statementNames = append(statementNames, statement.Name)
 		}
@@ -642,7 +673,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 
 	if len(nrc.globalPeerRouters) > 0 || len(nrc.nodePeerRouters) > 0 {
 
-		bgpActions.RouteAction = gobgpapi.RouteAction_ACCEPT
+		bgpActions.RouteAction = gobgpapi.RouteAction_ROUTE_ACTION_ACCEPT
 		if nrc.overrideNextHop {
 			bgpActions.Nexthop = &gobgpapi.NexthopAction{Self: true}
 		}
@@ -650,14 +681,14 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 		// set BGP communities for the routes advertised to peers for VIPs
 		if len(nrc.nodeCommunities) > 0 {
 			bgpActions.Community = &gobgpapi.CommunityAction{
-				Type:        gobgpapi.CommunityAction_ADD,
+				Type:        gobgpapi.CommunityAction_TYPE_ADD,
 				Communities: nrc.nodeCommunities,
 			}
 		}
 
 		for _, peerSet := range []string{externalPeerSet, externalPeerSetV6} {
 			peerSetEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-				{DefinedType: gobgpapi.DefinedType_NEIGHBOR, Name: peerSet},
+				{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: peerSet},
 			})
 			if err != nil {
 				return err
@@ -671,7 +702,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 				// statement to represent the export policy to permit advertising Service VIP's
 				// only to the global BGP peer or node specific BGP peer
 				vipSetEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-					{DefinedType: gobgpapi.DefinedType_PREFIX, Name: serviceVIPSet},
+					{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: serviceVIPSet},
 				})
 				if err != nil {
 					return err
@@ -684,11 +715,11 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 				statement := gobgpapi.Statement{
 					Conditions: &gobgpapi.Conditions{
 						PrefixSet: &gobgpapi.MatchSet{
-							Type: gobgpapi.MatchSet_ANY,
+							Type: gobgpapi.MatchSet_TYPE_ANY,
 							Name: serviceVIPSet,
 						},
 						NeighborSet: &gobgpapi.MatchSet{
-							Type: gobgpapi.MatchSet_ANY,
+							Type: gobgpapi.MatchSet_TYPE_ANY,
 							Name: peerSet,
 						},
 					},
@@ -696,7 +727,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 					Name:    serviceVIPSet + peerSet,
 				}
 				if err = nrc.ensureStatementExists(&statement); err != nil {
-					return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
+					return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
 				}
 				statementNames = append(statementNames, statement.Name)
 			}
@@ -706,7 +737,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 					// if we are configured to advertise POD CIDRs then add export policies for all of our IPv4 and IPv6
 					// peers for all IPv4 and IPv6 POD CIDRs
 					podCIDREmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-						{DefinedType: gobgpapi.DefinedType_PREFIX, Name: podSet},
+						{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: podSet},
 					})
 					if err != nil {
 						return err
@@ -719,11 +750,11 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 					statement := gobgpapi.Statement{
 						Conditions: &gobgpapi.Conditions{
 							PrefixSet: &gobgpapi.MatchSet{
-								Type: gobgpapi.MatchSet_ANY,
+								Type: gobgpapi.MatchSet_TYPE_ANY,
 								Name: podSet,
 							},
 							NeighborSet: &gobgpapi.MatchSet{
-								Type: gobgpapi.MatchSet_ANY,
+								Type: gobgpapi.MatchSet_TYPE_ANY,
 								Name: peerSet,
 							},
 						},
@@ -731,7 +762,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 						Name:    podSet + peerSet,
 					}
 					if err = nrc.ensureStatementExists(&statement); err != nil {
-						return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
+						return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
 					}
 					statementNames = append(statementNames, statement.Name)
 				}
@@ -762,7 +793,7 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 	}
 	err := nrc.bgpServer.ListPolicy(context.Background(), &gobgpapi.ListPolicyRequest{}, checkExistingPolicy)
 	if err != nil {
-		return errors.New("Failed to verify if kube-router BGP export policy exists: " + err.Error())
+		return fmt.Errorf("failed to verify if kube-router BGP export policy exists: %w", err)
 	}
 
 	// If this is the first time this is run and there is no current policy in GoBGP initialize it before sending it off
@@ -781,21 +812,22 @@ func (nrc *NetworkRoutingController) addExportPolicies() error {
 	klog.Infof("Current policy does not appear to match new policy: %s - creating new policy",
 		newPolicy.Name)
 	if err = nrc.incrementAndCreatePolicy(currentPolicyName, &newPolicy); err != nil {
-		return fmt.Errorf("could not increment and create new policy: %v", err)
+		return fmt.Errorf("could not increment and create new policy: %w", err)
 	}
 
 	klog.Infof("Ensuring that policy %s is assigned", newPolicy.Name)
-	err = nrc.assignPolicyByName(&newPolicy, gobgpapi.PolicyDirection_EXPORT, gobgpapi.RouteAction_REJECT)
+	err = nrc.assignPolicyByName(&newPolicy, gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT,
+		gobgpapi.RouteAction_ROUTE_ACTION_REJECT)
 	if err != nil {
-		return fmt.Errorf("could not assign policy by name: %v", err)
+		return fmt.Errorf("could not assign policy by name: %w", err)
 	}
 
 	if currentPolicyFound {
 		klog.Infof("Now that new policy %s has been created and assigned, removing previous policy %s",
 			newPolicy.Name, currentPolicyName)
-		if err = nrc.unassignAndRemovePolicy(currentPolicyName, gobgpapi.PolicyDirection_EXPORT,
-			gobgpapi.RouteAction_REJECT); err != nil {
-			return fmt.Errorf("could not clean up old policy: %v", err)
+		if err = nrc.unassignAndRemovePolicy(currentPolicyName, gobgpapi.PolicyDirection_POLICY_DIRECTION_EXPORT,
+			gobgpapi.RouteAction_ROUTE_ACTION_REJECT); err != nil {
+			return fmt.Errorf("could not clean up old policy: %w", err)
 		}
 	}
 
@@ -809,11 +841,11 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 	statementNames := make([]string, 0)
 
 	actions := gobgpapi.Actions{
-		RouteAction: gobgpapi.RouteAction_REJECT,
+		RouteAction: gobgpapi.RouteAction_ROUTE_ACTION_REJECT,
 	}
 	for _, peerSet := range []string{allPeerSet, allPeerSetV6} {
 		anyEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-			{DefinedType: gobgpapi.DefinedType_NEIGHBOR, Name: peerSet},
+			{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: peerSet},
 		})
 		if err != nil {
 			return err
@@ -824,8 +856,8 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 		}
 		for _, vipSet := range []string{serviceVIPsSet, serviceVIPsSetV6} {
 			vipSetEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
-				{DefinedType: gobgpapi.DefinedType_NEIGHBOR, Name: peerSet},
-				{DefinedType: gobgpapi.DefinedType_PREFIX, Name: vipSet},
+				{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_NEIGHBOR, Name: peerSet},
+				{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: vipSet},
 			})
 			if err != nil {
 				return err
@@ -838,11 +870,11 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 			statement := gobgpapi.Statement{
 				Conditions: &gobgpapi.Conditions{
 					PrefixSet: &gobgpapi.MatchSet{
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
 						Name: vipSet,
 					},
 					NeighborSet: &gobgpapi.MatchSet{
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
 						Name: peerSet,
 					},
 				},
@@ -850,49 +882,64 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 				Name:    vipSet + peerSet,
 			}
 			if err = nrc.ensureStatementExists(&statement); err != nil {
-				return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
+				return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
 			}
 			statementNames = append(statementNames, statement.Name)
 		}
 
-		statement := gobgpapi.Statement{
-			Conditions: &gobgpapi.Conditions{
-				PrefixSet: &gobgpapi.MatchSet{
-					Type: gobgpapi.MatchSet_ANY,
-					Name: defaultRouteSet,
-				},
-				NeighborSet: &gobgpapi.MatchSet{
-					Type: gobgpapi.MatchSet_ANY,
-					Name: peerSet,
-				},
-			},
-			Actions: &actions,
-			Name:    defaultRouteSet + peerSet,
-		}
-		if err = nrc.ensureStatementExists(&statement); err != nil {
-			return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
-		}
-		statementNames = append(statementNames, statement.Name)
-
-		if len(nrc.nodeCustomImportRejectIPNets) > 0 {
-			statement = gobgpapi.Statement{
+		for _, defaultSet := range []string{defaultRouteSet, defaultRouteSetV6} {
+			statement := gobgpapi.Statement{
 				Conditions: &gobgpapi.Conditions{
 					PrefixSet: &gobgpapi.MatchSet{
-						Name: customImportRejectSet,
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
+						Name: defaultSet,
 					},
 					NeighborSet: &gobgpapi.MatchSet{
-						Type: gobgpapi.MatchSet_ANY,
+						Type: gobgpapi.MatchSet_TYPE_ANY,
 						Name: peerSet,
 					},
 				},
 				Actions: &actions,
-				Name:    customImportRejectSet + peerSet,
+				Name:    defaultSet + peerSet,
 			}
 			if err = nrc.ensureStatementExists(&statement); err != nil {
-				return fmt.Errorf("could not check or create statement: %s - %v", statement.Name, err)
+				return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
 			}
 			statementNames = append(statementNames, statement.Name)
+		}
+
+		if len(nrc.nodeCustomImportRejectIPNets) > 0 {
+			for _, customRejectSet := range []string{customImportRejectSet, customImportRejectSetV6} {
+				// Referencing an empty defined set with MatchSet_TYPE_ANY would match all routes
+				// (see emptyCheckDefinedSets docstring), so skip families that have no entries.
+				customRejectSetEmpty, err := nrc.emptyCheckDefinedSets([]gobgpapi.ListDefinedSetRequest{
+					{DefinedType: gobgpapi.DefinedType_DEFINED_TYPE_PREFIX, Name: customRejectSet},
+				})
+				if err != nil {
+					return err
+				}
+				if customRejectSetEmpty {
+					continue
+				}
+				statement := gobgpapi.Statement{
+					Conditions: &gobgpapi.Conditions{
+						PrefixSet: &gobgpapi.MatchSet{
+							Name: customRejectSet,
+							Type: gobgpapi.MatchSet_TYPE_ANY,
+						},
+						NeighborSet: &gobgpapi.MatchSet{
+							Type: gobgpapi.MatchSet_TYPE_ANY,
+							Name: peerSet,
+						},
+					},
+					Actions: &actions,
+					Name:    customRejectSet + peerSet,
+				}
+				if err = nrc.ensureStatementExists(&statement); err != nil {
+					return fmt.Errorf("could not check or create statement: %s - %w", statement.Name, err)
+				}
+				statementNames = append(statementNames, statement.Name)
+			}
 		}
 	}
 
@@ -919,7 +966,7 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 	}
 	err := nrc.bgpServer.ListPolicy(context.Background(), &gobgpapi.ListPolicyRequest{}, checkExistingPolicy)
 	if err != nil {
-		return errors.New("Failed to verify if kube-router BGP export policy exists: " + err.Error())
+		return fmt.Errorf("failed to verify if kube-router BGP export policy exists: %w", err)
 	}
 
 	// If this is the first time this is run and there is no current policy in GoBGP initialize it before sending it off
@@ -938,21 +985,22 @@ func (nrc *NetworkRoutingController) addImportPolicies() error {
 	klog.Infof("Current policy does not appear to match new policy: %s - creating new policy",
 		newPolicy.Name)
 	if err = nrc.incrementAndCreatePolicy(currentPolicyName, &newPolicy); err != nil {
-		return fmt.Errorf("could not increment and create new policy: %v", err)
+		return fmt.Errorf("could not increment and create new policy: %w", err)
 	}
 
 	klog.Infof("Ensuring that policy %s is assigned", newPolicy.Name)
-	err = nrc.assignPolicyByName(&newPolicy, gobgpapi.PolicyDirection_IMPORT, gobgpapi.RouteAction_ACCEPT)
+	err = nrc.assignPolicyByName(&newPolicy, gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT,
+		gobgpapi.RouteAction_ROUTE_ACTION_ACCEPT)
 	if err != nil {
-		return fmt.Errorf("could not assign policy by name: %v", err)
+		return fmt.Errorf("could not assign policy by name: %w", err)
 	}
 
 	if currentPolicyFound {
 		klog.Infof("Now that new policy %s has been created and assigned, removing previous policy %s",
 			newPolicy.Name, currentPolicyName)
-		if err = nrc.unassignAndRemovePolicy(currentPolicyName, gobgpapi.PolicyDirection_IMPORT,
-			gobgpapi.RouteAction_ACCEPT); err != nil {
-			return fmt.Errorf("could not clean up old policy: %v", err)
+		if err = nrc.unassignAndRemovePolicy(currentPolicyName, gobgpapi.PolicyDirection_POLICY_DIRECTION_IMPORT,
+			gobgpapi.RouteAction_ROUTE_ACTION_ACCEPT); err != nil {
+			return fmt.Errorf("could not clean up old policy: %w", err)
 		}
 	}
 
@@ -983,7 +1031,7 @@ func (nrc *NetworkRoutingController) emptyCheckDefinedSets(defSets []gobgpapi.Li
 		}
 		//nolint:exhaustive // We have a default here we don't need to exhaustively list all possible gobgpapi types
 		switch defSets[idx].DefinedType {
-		case gobgpapi.DefinedType_PREFIX:
+		case gobgpapi.DefinedType_DEFINED_TYPE_PREFIX:
 			if len(ds.Prefixes) < 1 {
 				return true, nil
 			}
@@ -1011,7 +1059,7 @@ func (nrc *NetworkRoutingController) ensureStatementExists(st *gobgpapi.Statemen
 			}
 		})
 	if err != nil {
-		return fmt.Errorf("could not list statements: %v", err)
+		return fmt.Errorf("could not list statements: %w", err)
 	}
 
 	if found {
@@ -1022,7 +1070,7 @@ func (nrc *NetworkRoutingController) ensureStatementExists(st *gobgpapi.Statemen
 		Statement: st,
 	})
 	if err != nil {
-		return fmt.Errorf("could not add statement: %v", err)
+		return fmt.Errorf("could not add statement: %w", err)
 	}
 
 	return nil
@@ -1036,7 +1084,7 @@ func (nrc *NetworkRoutingController) incrementAndCreatePolicy(curPolName string,
 	var err error
 	// sanity check
 	if curPolName == "" {
-		return fmt.Errorf("we require that curPolName be non-blank before calling this method")
+		return errors.New("we require that curPolName be non-blank before calling this method")
 	}
 
 	matches := rePolicyVersionExtractor.FindStringSubmatch(curPolName)
@@ -1046,7 +1094,7 @@ func (nrc *NetworkRoutingController) incrementAndCreatePolicy(curPolName string,
 	case 3:
 		polBaseName = matches[1]
 		if polVer, err = strconv.Atoi(matches[2]); err != nil {
-			return fmt.Errorf("failed to parse %s GoBGP policy name: %v", curPolName, err)
+			return fmt.Errorf("failed to parse %s GoBGP policy name: %w", curPolName, err)
 		}
 	default:
 		return fmt.Errorf("failed to parse %s GoBGP policy name via regex", curPolName)
@@ -1059,7 +1107,7 @@ func (nrc *NetworkRoutingController) incrementAndCreatePolicy(curPolName string,
 		ReferExistingStatements: true,
 	})
 	if err != nil {
-		return errors.New("Failed to add policy: " + err.Error())
+		return fmt.Errorf("failed to add policy: %w", err)
 	}
 
 	return nil
@@ -1081,7 +1129,7 @@ func (nrc *NetworkRoutingController) assignPolicyByName(newPolicy *gobgpapi.Poli
 		&gobgpapi.ListPolicyAssignmentRequest{Name: "global", Direction: polDir},
 		checkExistingPolicyAssignment)
 	if err != nil {
-		return errors.New("Failed to verify if kube-router BGP export policy assignment exists: " + err.Error())
+		return fmt.Errorf("failed to verify if kube-router BGP export policy assignment exists: %w", err)
 	}
 	if policyAssignmentExists {
 		return nil
@@ -1097,7 +1145,7 @@ func (nrc *NetworkRoutingController) assignPolicyByName(newPolicy *gobgpapi.Poli
 	err = nrc.bgpServer.AddPolicyAssignment(context.Background(),
 		&gobgpapi.AddPolicyAssignmentRequest{Assignment: &policyAssignment})
 	if err != nil {
-		return errors.New("Failed to add policy assignment: " + err.Error())
+		return fmt.Errorf("failed to add policy assignment: %w", err)
 	}
 
 	return nil
@@ -1118,7 +1166,7 @@ func (nrc *NetworkRoutingController) unassignAndRemovePolicy(policyName string,
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("could not delete policy assignment for: %s - %v", policyName, err)
+		return fmt.Errorf("could not delete policy assignment for: %s - %w", policyName, err)
 	}
 
 	err = nrc.bgpServer.DeletePolicy(context.Background(), &gobgpapi.DeletePolicyRequest{
@@ -1127,7 +1175,7 @@ func (nrc *NetworkRoutingController) unassignAndRemovePolicy(policyName string,
 		All:                true, // All here tells GoBGP to delete the policy instead of just clearing the statements
 	})
 	if err != nil {
-		return fmt.Errorf("could not delete policy for: %s - %v", policyName, err)
+		return fmt.Errorf("could not delete policy for: %s - %w", policyName, err)
 	}
 
 	return nil

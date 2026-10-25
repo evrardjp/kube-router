@@ -9,7 +9,7 @@ metadata:
 data:
   cni-conf.json: |
     {
-       "cniVersion":"0.3.0",
+       "cniVersion":"1.0.0",
        "name":"mynet",
        "plugins":[
           {
@@ -66,12 +66,22 @@ spec:
               fieldPath: metadata.name
         - name: KUBE_ROUTER_CNI_CONF_FILE
           value: /etc/cni/net.d/10-kuberouter.conflist
+        # Cache sync can take up to --cache-sync-timeout (default 1m), so gate liveness behind a startup probe
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 20244
+          periodSeconds: 5
+          failureThreshold: 30
+        # /healthz only checks that the controllers are still heartbeating, i.e. that kube-router isn't stuck in a
+        # control loop. It doesn't verify that the networking it programmed is correct. With these settings, roughly
+        # nine seconds without a heartbeat and the kubelet restarts the container.
         livenessProbe:
           httpGet:
             path: /healthz
             port: 20244
-          initialDelaySeconds: 10
           periodSeconds: 3
+          failureThreshold: 3
         resources:
           requests:
             cpu: 250m
@@ -115,6 +125,10 @@ spec:
           mountPath: /opt
       hostNetwork: true
       hostPID: true
+      # Inherit the host resolver: we resolve no hostnames, and cluster DNS would depend on our own service proxy
+      dnsPolicy: Default
+      nodeSelector:
+        kubernetes.io/os: linux
       tolerations:
       - effect: NoSchedule
         operator: Exists
@@ -152,7 +166,6 @@ kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kube-router
-  namespace: kube-system
 rules:
   - apiGroups:
     - ""
@@ -161,7 +174,6 @@ rules:
       - pods
       - services
       - nodes
-      - endpoints
     verbs:
       - list
       - get
@@ -173,14 +185,6 @@ rules:
     verbs:
       - list
       - get
-      - watch
-  - apiGroups:
-    - extensions
-    resources:
-      - networkpolicies
-    verbs:
-      - get
-      - list
       - watch
   - apiGroups:
       - "coordination.k8s.io"

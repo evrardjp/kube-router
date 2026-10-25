@@ -1,15 +1,18 @@
 package routing
 
 import (
+	"context"
+	"errors"
 	"net/url"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/aws/smithy-go"
 	"k8s.io/klog/v2"
 
 	v1core "k8s.io/api/core/v1"
@@ -20,10 +23,9 @@ const (
 	awsMaxRetries             = 5
 )
 
-// disableSourceDestinationCheck disables src-dst check of all the VM's when cluster
-// is provisioned on AWS. EC2 by default drops any packets originating or destination
-// to a VM with IP other than that of VM's ip. This check needs to be disabled so that
-// cross node pod-to-pod traffic can be sent and received by a VM.
+// disableSourceDestinationCheck disables src-dst check of all the VM's when cluster is provisioned on AWS. EC2 by
+// default drops any packets originating or destination to a VM with IP other than that of VM's ip. This check needs to
+// be disabled so that cross node pod-to-pod traffic can be sent and received by a VM.
 func (nrc *NetworkRoutingController) disableSourceDestinationCheck() {
 	nodes := nrc.nodeLister.List()
 
@@ -35,40 +37,53 @@ func (nrc *NetworkRoutingController) disableSourceDestinationCheck() {
 		providerID := strings.Replace(node.Spec.ProviderID, "///", "//", 1)
 		URL, err := url.Parse(providerID)
 		if err != nil {
-			klog.Errorf("Failed to parse URL for providerID " + providerID + " : " + err.Error())
+			klog.Errorf("failed to parse URL for providerID %s: %v", providerID, err)
 			return
 		}
 		instanceID := URL.Path
 		instanceID = strings.Trim(instanceID, "/")
 
-		sess, _ := session.NewSession(aws.NewConfig().WithMaxRetries(awsMaxRetries))
-		metadataClient := ec2metadata.New(sess)
-		region, err := metadataClient.Region()
+		// First, get the region from IMDS. This must be done before loading the full config because when using IRSA
+		// (IAM Roles for Service Accounts), the STS client needs a region configured before it can assume the role to
+		// get credentials.
+		imdsClient := imds.New(imds.Options{})
+		region, err := imdsClient.GetRegion(context.TODO(), &imds.GetRegionInput{})
 		if err != nil {
-			klog.Errorf("Failed to disable source destination check due to: " + err.Error())
+			klog.Errorf("failed to get region from IMDS: %v", err)
 			return
 		}
-		sess.Config.Region = aws.String(region)
-		ec2Client := ec2.New(sess)
-		_, err = ec2Client.ModifyInstanceAttribute(
+
+		// Now load the full AWS config with the region already set
+		cfg, err := config.LoadDefaultConfig(context.TODO(),
+			config.WithRegion(region.Region),
+			config.WithRetryMaxAttempts(awsMaxRetries))
+		if err != nil {
+			klog.Errorf("failed to load AWS config: %v", err)
+			return
+		}
+		ec2Client := ec2.NewFromConfig(cfg)
+		_, err = ec2Client.ModifyInstanceAttribute(context.TODO(),
 			&ec2.ModifyInstanceAttributeInput{
 				InstanceId: aws.String(instanceID),
-				SourceDestCheck: &ec2.AttributeBooleanValue{
+				SourceDestCheck: &types.AttributeBooleanValue{
 					Value: aws.Bool(false),
 				},
 			},
 		)
 		if err != nil {
-			awsErr := err.(awserr.Error)
-			if awsErr.Code() == "UnauthorizedOperation" {
-				nrc.ec2IamAuthorized = false
-				klog.Errorf("Node does not have necessary IAM creds to modify instance attribute. So skipping " +
-					"disabling src-dst check.")
-				return
+			var apiErr smithy.APIError
+			if errors.As(err, &apiErr) {
+				if apiErr.ErrorCode() == "UnauthorizedOperation" {
+					nrc.ec2IamAuthorized.Store(false)
+					klog.Errorf("Node does not have necessary IAM creds to modify instance attribute. So skipping "+
+						"disabling src-dst check. %v", apiErr.ErrorMessage())
+					return
+
+				}
 			}
-			klog.Errorf("Failed to disable source destination check due to: %v", err.Error())
+			klog.Errorf("failed to disable source destination check due to: %v", err)
 		} else {
-			klog.Infof("Disabled source destination check for the instance: " + instanceID)
+			klog.Infof("disabled source destination check for the instance: %s", instanceID)
 		}
 
 		// to prevent EC2 rejecting API call due to API throttling give a delay between the calls

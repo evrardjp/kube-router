@@ -2,7 +2,6 @@ package routing
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"os"
 	"reflect"
@@ -10,16 +9,25 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cloudnativelabs/kube-router/v2/pkg/bgp"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/k8s/indexers"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1core "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 
-	gobgpapi "github.com/osrg/gobgp/v3/api"
-	gobgp "github.com/osrg/gobgp/v3/pkg/server"
+	gobgpapi "github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/apiutil"
+	bgppkt "github.com/osrg/gobgp/v4/pkg/packet/bgp"
+	gobgp "github.com/osrg/gobgp/v4/pkg/server"
 )
 
 func Test_advertiseClusterIPs(t *testing.T) {
@@ -27,18 +35,19 @@ func Test_advertiseClusterIPs(t *testing.T) {
 		name              string
 		nrc               *NetworkRoutingController
 		existingServices  []*v1core.Service
-		existingEndpoints []*v1core.Endpoints
+		existingEndpoints []*discoveryv1.EndpointSlice
 		// the key is the subnet from the watch event
 		watchEvents map[string]bool
 	}{
-
 		{
 			"add bgp path for service with ClusterIP",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -55,19 +64,18 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -80,9 +88,11 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			"add bgp path for service with ClusterIP/NodePort/LoadBalancer",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -123,19 +133,18 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -143,14 +152,13 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -158,14 +166,13 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -180,9 +187,11 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			"add bgp path for invalid service type",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -210,19 +219,18 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -230,14 +238,13 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -250,9 +257,11 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			"add bgp path for headless service",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -293,19 +302,18 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -313,14 +321,13 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -328,14 +335,13 @@ func Test_advertiseClusterIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -365,26 +371,27 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			}()
 
 			clientset := fake.NewSimpleClientset()
-			startInformersForRoutes(testcase.nrc, clientset)
+			startInformersForRoutes(t, testcase.nrc, clientset)
 
 			err = createServices(clientset, testcase.existingServices)
 			if err != nil {
 				t.Fatalf("failed to create existing services: %v", err)
 			}
 
-			err = createEndpoints(clientset, testcase.existingEndpoints)
+			err = createEndpointSlices(clientset, testcase.existingEndpoints)
 			if err != nil {
-				t.Fatalf("failed to create existing endpoints: %v", err)
+				t.Fatalf("failed to create existing endpoint slices: %v", err)
 			}
 
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
 
 			eventMu := sync.Mutex{}
-			var events []*gobgpapi.Path
-			pathWatch := func(r *gobgpapi.WatchEventResponse) {
-				if table := r.GetTable(); table != nil {
-					for _, p := range table.Paths {
-						if p.Family.Afi == gobgpapi.Family_AFI_IP || p.Family.Safi == gobgpapi.Family_SAFI_UNICAST {
+			var events []*apiutil.Path
+			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
+				OnBestPath: func(paths []*apiutil.Path, _ time.Time) {
+					for _, p := range paths {
+						// Check if path is IPv4 or IPv6 unicast
+						if p.Family == bgppkt.RF_IPv4_UC || p.Family == bgppkt.RF_IPv6_UC {
 							func() {
 								defer eventMu.Unlock()
 								eventMu.Lock()
@@ -392,17 +399,8 @@ func Test_advertiseClusterIPs(t *testing.T) {
 							}()
 						}
 					}
-				}
-			}
-			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), &gobgpapi.WatchEventRequest{
-				Table: &gobgpapi.WatchEventRequest_Table{
-					Filters: []*gobgpapi.WatchEventRequest_Table_Filter{
-						{
-							Type: gobgpapi.WatchEventRequest_Table_Filter_BEST,
-						},
-					},
 				},
-			}, pathWatch)
+			}, gobgp.WatchBestPath(true))
 			if err != nil {
 				t.Fatalf("failed to register callback to mortor global routing table: %v", err)
 			}
@@ -412,8 +410,8 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			testcase.nrc.advertiseLoadBalancerIP = false
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getVIPs()
-			testcase.nrc.advertiseVIPs(toAdvertise)
-			testcase.nrc.withdrawVIPs(toWithdraw)
+			require.NoError(t, testcase.nrc.advertiseVIPs(toAdvertise))
+			require.NoError(t, testcase.nrc.withdrawVIPs(toWithdraw))
 
 			timeoutCh := time.After(time.Second * 10)
 			ticker := time.NewTicker(100 * time.Millisecond)
@@ -437,13 +435,12 @@ func Test_advertiseClusterIPs(t *testing.T) {
 			defer eventMu.Unlock()
 			eventMu.Lock()
 			for _, path := range events {
-				nlri := path.GetNlri()
-				var prefix gobgpapi.IPAddressPrefix
-				err = nlri.UnmarshalTo(&prefix)
-				if err != nil {
-					t.Fatalf("Invalid nlri in advertised path")
+				// apiutil.Path has the NLRI as a native BGP type directly
+				ipPrefix, ok := path.Nlri.(*bgppkt.IPAddrPrefix)
+				if !ok {
+					t.Fatalf("Unexpected NLRI type: %T", path.Nlri)
 				}
-				advertisedPrefix := prefix.Prefix + "/" + fmt.Sprint(prefix.PrefixLen)
+				advertisedPrefix := ipPrefix.Prefix.String()
 				if _, ok := testcase.watchEvents[advertisedPrefix]; !ok {
 					t.Errorf("got unexpected path: %v", advertisedPrefix)
 				}
@@ -457,7 +454,7 @@ func Test_advertiseExternalIPs(t *testing.T) {
 		name              string
 		nrc               *NetworkRoutingController
 		existingServices  []*v1core.Service
-		existingEndpoints []*v1core.Endpoints
+		existingEndpoints []*discoveryv1.EndpointSlice
 		// the key is the subnet from the watch event
 		watchEvents map[string]bool
 	}{
@@ -465,9 +462,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"add bgp path for service with external IPs",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP("10.0.0.1"),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP("10.0.0.1"),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -485,19 +484,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -511,9 +509,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"add bgp path for services with external IPs of type ClusterIP/NodePort/LoadBalancer",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -557,19 +557,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -577,14 +576,13 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -592,14 +590,13 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -615,9 +612,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"add bgp path for invalid service type",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -648,19 +647,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -668,14 +666,13 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -688,9 +685,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"add bgp path for headless service",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -734,19 +733,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -754,14 +752,13 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -769,14 +766,13 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -789,9 +785,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"skip bgp path to loadbalancerIP for service without LoadBalancer IP",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -817,19 +815,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -840,9 +837,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"add bgp path to loadbalancerIP for service with LoadBalancer IP",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -871,19 +870,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -897,9 +895,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"no bgp path to nil loadbalancerIPs for service with LoadBalancer",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -921,19 +921,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -944,9 +943,11 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			"no bgp path to loadbalancerIPs for service with LoadBalancer and skiplbips annotation",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -978,19 +979,18 @@ func Test_advertiseExternalIPs(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1017,12 +1017,12 @@ func Test_advertiseExternalIPs(t *testing.T) {
 				}
 			}()
 
-			var events []*gobgpapi.Path
+			var events []*apiutil.Path
 			eventMu := sync.Mutex{}
-			pathWatch := func(r *gobgpapi.WatchEventResponse) {
-				if table := r.GetTable(); table != nil {
-					for _, p := range table.Paths {
-						if p.Family.Afi == gobgpapi.Family_AFI_IP || p.Family.Safi == gobgpapi.Family_SAFI_UNICAST {
+			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
+				OnBestPath: func(paths []*apiutil.Path, _ time.Time) {
+					for _, p := range paths {
+						if p.Family == bgppkt.RF_IPv4_UC || p.Family == bgppkt.RF_IPv6_UC {
 							func() {
 								defer eventMu.Unlock()
 								eventMu.Lock()
@@ -1030,31 +1030,22 @@ func Test_advertiseExternalIPs(t *testing.T) {
 							}()
 						}
 					}
-				}
-			}
-			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), &gobgpapi.WatchEventRequest{
-				Table: &gobgpapi.WatchEventRequest_Table{
-					Filters: []*gobgpapi.WatchEventRequest_Table_Filter{
-						{
-							Type: gobgpapi.WatchEventRequest_Table_Filter_BEST,
-						},
-					},
 				},
-			}, pathWatch)
+			}, gobgp.WatchBestPath(true))
 			if err != nil {
 				t.Fatalf("failed to register callback to mortor global routing table: %v", err)
 			}
 			clientset := fake.NewSimpleClientset()
-			startInformersForRoutes(testcase.nrc, clientset)
+			startInformersForRoutes(t, testcase.nrc, clientset)
 
 			err = createServices(clientset, testcase.existingServices)
 			if err != nil {
 				t.Fatalf("failed to create existing services: %v", err)
 			}
 
-			err = createEndpoints(clientset, testcase.existingEndpoints)
+			err = createEndpointSlices(clientset, testcase.existingEndpoints)
 			if err != nil {
-				t.Fatalf("failed to create existing endpoints: %v", err)
+				t.Fatalf("failed to create existing endpoint slices: %v", err)
 			}
 
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
@@ -1065,8 +1056,8 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			testcase.nrc.advertiseLoadBalancerIP = true
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getVIPs()
-			testcase.nrc.advertiseVIPs(toAdvertise)
-			testcase.nrc.withdrawVIPs(toWithdraw)
+			require.NoError(t, testcase.nrc.advertiseVIPs(toAdvertise))
+			require.NoError(t, testcase.nrc.withdrawVIPs(toWithdraw))
 			timeoutCh := time.After(time.Second * 10)
 			ticker := time.NewTicker(500 * time.Millisecond)
 
@@ -1090,13 +1081,12 @@ func Test_advertiseExternalIPs(t *testing.T) {
 			defer eventMu.Unlock()
 			eventMu.Lock()
 			for _, path := range events {
-				nlri := path.GetNlri()
-				var prefix gobgpapi.IPAddressPrefix
-				err = nlri.UnmarshalTo(&prefix)
-				if err != nil {
-					t.Fatalf("Invalid nlri in advertised path")
+				// apiutil.Path has the NLRI as a native BGP type directly
+				ipPrefix, ok := path.Nlri.(*bgppkt.IPAddrPrefix)
+				if !ok {
+					t.Fatalf("Unexpected NLRI type: %T", path.Nlri)
 				}
-				advertisedPrefix := prefix.Prefix + "/" + fmt.Sprint(prefix.PrefixLen)
+				advertisedPrefix := ipPrefix.Prefix.String()
 				if _, ok := testcase.watchEvents[advertisedPrefix]; !ok {
 					t.Errorf("got unexpected path: %v", advertisedPrefix)
 				}
@@ -1110,7 +1100,7 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 		name              string
 		nrc               *NetworkRoutingController
 		existingServices  []*v1core.Service
-		existingEndpoints []*v1core.Endpoints
+		existingEndpoints []*discoveryv1.EndpointSlice
 		// the key is the subnet from the watch event
 		watchEvents map[string]bool
 	}{
@@ -1118,9 +1108,11 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 			"add bgp paths for all service IPs",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -1176,19 +1168,18 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1196,14 +1187,13 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1211,14 +1201,13 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1239,9 +1228,11 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 			"opt out to advertise any IPs via annotations",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -1276,19 +1267,18 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1315,12 +1305,12 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 				}
 			}()
 
-			var events []*gobgpapi.Path
+			var events []*apiutil.Path
 			eventMu := sync.Mutex{}
-			pathWatch := func(r *gobgpapi.WatchEventResponse) {
-				if table := r.GetTable(); table != nil {
-					for _, p := range table.Paths {
-						if p.Family.Afi == gobgpapi.Family_AFI_IP || p.Family.Safi == gobgpapi.Family_SAFI_UNICAST {
+			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
+				OnBestPath: func(paths []*apiutil.Path, _ time.Time) {
+					for _, p := range paths {
+						if p.Family == bgppkt.RF_IPv4_UC || p.Family == bgppkt.RF_IPv6_UC {
 							func() {
 								defer eventMu.Unlock()
 								eventMu.Lock()
@@ -1328,30 +1318,21 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 							}()
 						}
 					}
-				}
-			}
-			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), &gobgpapi.WatchEventRequest{
-				Table: &gobgpapi.WatchEventRequest_Table{
-					Filters: []*gobgpapi.WatchEventRequest_Table_Filter{
-						{
-							Type: gobgpapi.WatchEventRequest_Table_Filter_BEST,
-						},
-					},
 				},
-			}, pathWatch)
+			}, gobgp.WatchBestPath(true))
 			if err != nil {
 				t.Fatalf("failed to register callback to mortor global routing table: %v", err)
 			}
 
 			clientset := fake.NewSimpleClientset()
-			startInformersForRoutes(testcase.nrc, clientset)
+			startInformersForRoutes(t, testcase.nrc, clientset)
 
 			err = createServices(clientset, testcase.existingServices)
 			if err != nil {
 				t.Fatalf("failed to create existing services: %v", err)
 			}
 
-			err = createEndpoints(clientset, testcase.existingEndpoints)
+			err = createEndpointSlices(clientset, testcase.existingEndpoints)
 			if err != nil {
 				t.Fatalf("failed to create existing endpoints: %v", err)
 			}
@@ -1364,8 +1345,8 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 			testcase.nrc.advertiseLoadBalancerIP = true
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getVIPs()
-			testcase.nrc.advertiseVIPs(toAdvertise)
-			testcase.nrc.withdrawVIPs(toWithdraw)
+			require.NoError(t, testcase.nrc.advertiseVIPs(toAdvertise))
+			require.NoError(t, testcase.nrc.withdrawVIPs(toWithdraw))
 			timeoutCh := time.After(time.Second * 10)
 			ticker := time.NewTicker(100 * time.Millisecond)
 
@@ -1389,13 +1370,12 @@ func Test_advertiseAnnotationOptOut(t *testing.T) {
 			defer eventMu.Unlock()
 			eventMu.Lock()
 			for _, path := range events {
-				nlri := path.GetNlri()
-				var prefix gobgpapi.IPAddressPrefix
-				err = nlri.UnmarshalTo(&prefix)
-				if err != nil {
-					t.Fatalf("Invalid nlri in advertised path")
+				// apiutil.Path has the NLRI as a native BGP type directly
+				ipPrefix, ok := path.Nlri.(*bgppkt.IPAddrPrefix)
+				if !ok {
+					t.Fatalf("Unexpected NLRI type: %T", path.Nlri)
 				}
-				advertisedPrefix := prefix.Prefix + "/" + fmt.Sprint(prefix.PrefixLen)
+				advertisedPrefix := ipPrefix.Prefix.String()
 				if _, ok := testcase.watchEvents[advertisedPrefix]; !ok {
 					t.Errorf("got unexpected path: %v", advertisedPrefix)
 				}
@@ -1409,7 +1389,7 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 		name              string
 		nrc               *NetworkRoutingController
 		existingServices  []*v1core.Service
-		existingEndpoints []*v1core.Endpoints
+		existingEndpoints []*discoveryv1.EndpointSlice
 		// the key is the subnet from the watch event
 		watchEvents map[string]bool
 	}{
@@ -1417,9 +1397,11 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 			"no bgp paths for any service IPs",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -1477,19 +1459,18 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1497,14 +1478,13 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1512,14 +1492,13 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1530,9 +1509,11 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 			"opt in to advertise all IPs via annotations",
 			&NetworkRoutingController{
 				bgpServer: gobgp.NewBgpServer(),
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			[]*v1core.Service{
@@ -1603,19 +1584,18 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					},
 				},
 			},
-			[]*v1core.Endpoints{
+			[]*discoveryv1.EndpointSlice{
 				{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-1",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-1",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1623,14 +1603,13 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-2",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-2",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1638,14 +1617,13 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "svc-3",
 						Namespace: "default",
+						Labels: map[string]string{
+							"kubernetes.io/service-name": "svc-3",
+						},
 					},
-					Subsets: []v1core.EndpointSubset{
+					Endpoints: []discoveryv1.Endpoint{
 						{
-							Addresses: []v1core.EndpointAddress{
-								{
-									IP: testNodeIPv4,
-								},
-							},
+							Addresses: []string{testNodeIPv4},
 						},
 					},
 				},
@@ -1682,12 +1660,12 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 				}
 			}()
 
-			var events []*gobgpapi.Path
+			var events []*apiutil.Path
 			eventMu := sync.Mutex{}
-			pathWatch := func(r *gobgpapi.WatchEventResponse) {
-				if table := r.GetTable(); table != nil {
-					for _, p := range table.Paths {
-						if p.Family.Afi == gobgpapi.Family_AFI_IP || p.Family.Safi == gobgpapi.Family_SAFI_UNICAST {
+			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
+				OnBestPath: func(paths []*apiutil.Path, _ time.Time) {
+					for _, p := range paths {
+						if p.Family == bgppkt.RF_IPv4_UC || p.Family == bgppkt.RF_IPv6_UC {
 							func() {
 								defer eventMu.Unlock()
 								eventMu.Lock()
@@ -1695,32 +1673,23 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 							}()
 						}
 					}
-				}
-			}
-			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), &gobgpapi.WatchEventRequest{
-				Table: &gobgpapi.WatchEventRequest_Table{
-					Filters: []*gobgpapi.WatchEventRequest_Table_Filter{
-						{
-							Type: gobgpapi.WatchEventRequest_Table_Filter_BEST,
-						},
-					},
 				},
-			}, pathWatch)
+			}, gobgp.WatchBestPath(true))
 			if err != nil {
 				t.Fatalf("failed to register callback to mortor global routing table: %v", err)
 			}
 
 			clientset := fake.NewSimpleClientset()
-			startInformersForRoutes(testcase.nrc, clientset)
+			startInformersForRoutes(t, testcase.nrc, clientset)
 
 			err = createServices(clientset, testcase.existingServices)
 			if err != nil {
 				t.Fatalf("failed to create existing services: %v", err)
 			}
 
-			err = createEndpoints(clientset, testcase.existingEndpoints)
+			err = createEndpointSlices(clientset, testcase.existingEndpoints)
 			if err != nil {
-				t.Fatalf("failed to create existing endpoints: %v", err)
+				t.Fatalf("failed to create existing endpoint slices: %v", err)
 			}
 
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
@@ -1731,8 +1700,8 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 			testcase.nrc.advertiseLoadBalancerIP = false
 
 			toAdvertise, toWithdraw, _ := testcase.nrc.getVIPs()
-			testcase.nrc.advertiseVIPs(toAdvertise)
-			testcase.nrc.withdrawVIPs(toWithdraw)
+			require.NoError(t, testcase.nrc.advertiseVIPs(toAdvertise))
+			require.NoError(t, testcase.nrc.withdrawVIPs(toWithdraw))
 
 			timeoutCh := time.After(time.Second * 10)
 			ticker := time.NewTicker(100 * time.Millisecond)
@@ -1757,13 +1726,12 @@ func Test_advertiseAnnotationOptIn(t *testing.T) {
 			defer eventMu.Unlock()
 			eventMu.Lock()
 			for _, path := range events {
-				nlri := path.GetNlri()
-				var prefix gobgpapi.IPAddressPrefix
-				err = nlri.UnmarshalTo(&prefix)
-				if err != nil {
-					t.Fatalf("Invalid nlri in advertised path")
+				// apiutil.Path has the NLRI as a native BGP type directly
+				ipPrefix, ok := path.Nlri.(*bgppkt.IPAddrPrefix)
+				if !ok {
+					t.Fatalf("Unexpected NLRI type: %T", path.Nlri)
 				}
-				advertisedPrefix := prefix.Prefix + "/" + fmt.Sprint(prefix.PrefixLen)
+				advertisedPrefix := ipPrefix.Prefix.String()
 				if _, ok := testcase.watchEvents[advertisedPrefix]; !ok {
 					t.Errorf("got unexpected path: %v", advertisedPrefix)
 				}
@@ -1777,17 +1745,18 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 		name             string
 		nrc              *NetworkRoutingController
 		existingService  *v1core.Service
-		existingEndpoint *v1core.Endpoints
+		existingEndpoint *discoveryv1.EndpointSlice
 		nodeHasEndpoints bool
-		err              error
 	}{
 		{
 			"node has endpoints for service",
 			&NetworkRoutingController{
-				nodeName:  "node-1",
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			&v1core.Service{
@@ -1803,36 +1772,36 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 					ExternalTrafficPolicy: testClusterExtTrafPol,
 				},
 			},
-			&v1core.Endpoints{
+			&discoveryv1.EndpointSlice{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "svc-1",
 					Namespace: "default",
+					Labels: map[string]string{
+						"kubernetes.io/service-name": "svc-1",
+					},
 				},
-				Subsets: []v1core.EndpointSubset{
+				Endpoints: []discoveryv1.Endpoint{
 					{
-						Addresses: []v1core.EndpointAddress{
-							{
-								IP:       "172.20.1.1",
-								NodeName: ptrToString("node-1"),
-							},
-							{
-								IP:       "172.20.1.2",
-								NodeName: ptrToString("node-2"),
-							},
-						},
+						Addresses: []string{"172.20.1.1"},
+						NodeName:  new("node-1"),
+					},
+					{
+						Addresses: []string{"172.20.1.2"},
+						NodeName:  new("node-2"),
 					},
 				},
 			},
 			true,
-			nil,
 		},
 		{
 			"node has no endpoints for service",
 			&NetworkRoutingController{
-				nodeName:  "node-1",
-				primaryIP: net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			&v1core.Service{
@@ -1848,37 +1817,35 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 					ExternalTrafficPolicy: testClusterExtTrafPol,
 				},
 			},
-			&v1core.Endpoints{
+			&discoveryv1.EndpointSlice{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "svc-1",
 					Namespace: "default",
+					Labels: map[string]string{
+						"kubernetes.io/service-name": "svc-1",
+					},
 				},
-				Subsets: []v1core.EndpointSubset{
+				Endpoints: []discoveryv1.Endpoint{
 					{
-						Addresses: []v1core.EndpointAddress{
-							{
-								IP:       "172.20.1.1",
-								NodeName: ptrToString("node-2"),
-							},
-							{
-								IP:       "172.20.1.2",
-								NodeName: ptrToString("node-3"),
-							},
-						},
+						Addresses: []string{"172.20.1.1"},
+						NodeName:  new("node-2"),
+					},
+					{
+						Addresses: []string{"172.20.1.2"},
+						NodeName:  new("node-3"),
 					},
 				},
 			},
 			false,
-			nil,
 		},
 	}
 
 	for _, testcase := range testcases {
 		t.Run(testcase.name, func(t *testing.T) {
 			clientset := fake.NewSimpleClientset()
-			startInformersForRoutes(testcase.nrc, clientset)
+			startInformersForRoutes(t, testcase.nrc, clientset)
 
-			_, err := clientset.CoreV1().Endpoints("default").Create(context.Background(), testcase.existingEndpoint, metav1.CreateOptions{})
+			_, err := clientset.DiscoveryV1().EndpointSlices("default").Create(context.Background(), testcase.existingEndpoint, metav1.CreateOptions{})
 			if err != nil {
 				t.Fatalf("failed to create existing endpoints: %v", err)
 			}
@@ -1889,20 +1856,17 @@ func Test_nodeHasEndpointsForService(t *testing.T) {
 			}
 
 			waitForListerWithTimeout(testcase.nrc.svcLister, time.Second*10, t)
-			waitForListerWithTimeout(testcase.nrc.epLister, time.Second*10, t)
+			waitForListerWithTimeout(testcase.nrc.epSliceLister, time.Second*10, t)
 
 			nodeHasEndpoints, err := testcase.nrc.nodeHasEndpointsForService(testcase.existingService)
-			if !reflect.DeepEqual(err, testcase.err) {
-				t.Logf("actual err: %v", err)
-				t.Logf("expected err: %v", testcase.err)
-				t.Error("unexpected error")
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
 			}
 			if nodeHasEndpoints != testcase.nodeHasEndpoints {
 				t.Logf("expected nodeHasEndpoints: %v", testcase.nodeHasEndpoints)
 				t.Logf("actual nodeHasEndpoints: %v", nodeHasEndpoints)
 				t.Error("unexpected nodeHasEndpoints")
 			}
-
 		})
 	}
 }
@@ -1915,18 +1879,19 @@ func Test_advertisePodRoute(t *testing.T) {
 		node        *v1core.Node
 		// the key is the subnet from the watch event
 		watchEvents map[string]bool
-		err         error
 	}{
 		{
 			"add bgp path for pod cidr using NODE_NAME",
 			&NetworkRoutingController{
-				bgpServer:     gobgp.NewBgpServer(),
-				podCidr:       "172.20.0.0/24",
-				isIPv4Capable: true,
-				podIPv4CIDRs:  []string{"172.20.0.0/24"},
-				primaryIP:     net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				bgpServer:    gobgp.NewBgpServer(),
+				podCidr:      "172.20.0.0/24",
+				podIPv4CIDRs: []string{"172.20.0.0/24"},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			"node-1",
@@ -1944,7 +1909,6 @@ func Test_advertisePodRoute(t *testing.T) {
 			map[string]bool{
 				"172.20.0.0/24": true,
 			},
-			nil,
 		},
 		{
 			"add bgp path for pod cidr using hostname override",
@@ -1952,11 +1916,13 @@ func Test_advertisePodRoute(t *testing.T) {
 				bgpServer:        gobgp.NewBgpServer(),
 				hostnameOverride: "node-1",
 				podCidr:          "172.20.0.0/24",
-				isIPv4Capable:    true,
 				podIPv4CIDRs:     []string{"172.20.0.0/24"},
-				primaryIP:        net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 			},
 			"",
@@ -1974,7 +1940,6 @@ func Test_advertisePodRoute(t *testing.T) {
 			map[string]bool{
 				"172.20.0.0/24": true,
 			},
-			nil,
 		},
 		{
 			"advertise IPv6 Address when enabled",
@@ -1983,13 +1948,15 @@ func Test_advertisePodRoute(t *testing.T) {
 				hostnameOverride: "node-1",
 				podCidr:          "2001:db8:42:2::/64",
 				podIPv6CIDRs:     []string{"2001:db8:42:2::/64"},
-				nodeIPv6Addrs: map[v1core.NodeAddressType][]net.IP{
-					v1core.NodeInternalIP: {net.IPv6loopback},
-				},
-				isIPv6Capable: true,
-				primaryIP:     net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+						NodeIPv6Addrs: map[v1core.NodeAddressType][]net.IP{
+							v1core.NodeInternalIP: {net.IPv6loopback},
+						},
+					},
 				},
 			},
 			"",
@@ -2007,7 +1974,6 @@ func Test_advertisePodRoute(t *testing.T) {
 			map[string]bool{
 				"2001:db8:42:2::/64": true,
 			},
-			nil,
 		},
 		/* disabling tests for now, as node POD cidr is read just once at the starting of the program
 		   Tests needs to be adopted to catch the errors when NetworkRoutingController starts
@@ -2066,12 +2032,12 @@ func Test_advertisePodRoute(t *testing.T) {
 				}
 			}()
 
-			var events []*gobgpapi.Path
+			var events []*apiutil.Path
 			eventMu := sync.Mutex{}
-			pathWatch := func(r *gobgpapi.WatchEventResponse) {
-				if table := r.GetTable(); table != nil {
-					for _, p := range table.Paths {
-						if p.Family.Afi == gobgpapi.Family_AFI_IP || p.Family.Safi == gobgpapi.Family_SAFI_UNICAST {
+			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), gobgp.WatchEventMessageCallbacks{
+				OnBestPath: func(paths []*apiutil.Path, _ time.Time) {
+					for _, p := range paths {
+						if p.Family == bgppkt.RF_IPv4_UC || p.Family == bgppkt.RF_IPv6_UC {
 							func() {
 								defer eventMu.Unlock()
 								eventMu.Lock()
@@ -2079,17 +2045,8 @@ func Test_advertisePodRoute(t *testing.T) {
 							}()
 						}
 					}
-				}
-			}
-			err = testcase.nrc.bgpServer.WatchEvent(context.Background(), &gobgpapi.WatchEventRequest{
-				Table: &gobgpapi.WatchEventRequest_Table{
-					Filters: []*gobgpapi.WatchEventRequest_Table_Filter{
-						{
-							Type: gobgpapi.WatchEventRequest_Table_Filter_BEST,
-						},
-					},
 				},
-			}, pathWatch)
+			}, gobgp.WatchBestPath(true))
 			if err != nil {
 				t.Fatalf("failed to register callback to mortor global routing table: %v", err)
 			}
@@ -2104,11 +2061,8 @@ func Test_advertisePodRoute(t *testing.T) {
 			_ = os.Setenv("NODE_NAME", testcase.envNodeName)
 			defer func() { _ = os.Unsetenv("NODE_NAME") }()
 
-			err = testcase.nrc.advertisePodRoute()
-			if !reflect.DeepEqual(err, testcase.err) {
-				t.Logf("actual error: %v", err)
-				t.Logf("expected error: %v", testcase.err)
-				t.Error("did not get expected error")
+			if err := testcase.nrc.advertisePodRoute(); err != nil {
+				t.Errorf("unexpected error: %v", err)
 			}
 
 			timeoutCh := time.After(time.Second * 10)
@@ -2134,13 +2088,12 @@ func Test_advertisePodRoute(t *testing.T) {
 			defer eventMu.Unlock()
 			eventMu.Lock()
 			for _, path := range events {
-				nlri := path.GetNlri()
-				var prefix gobgpapi.IPAddressPrefix
-				err = nlri.UnmarshalTo(&prefix)
-				if err != nil {
-					t.Fatalf("Invalid nlri in advertised path")
+				// apiutil.Path has the NLRI as a native BGP type directly
+				ipPrefix, ok := path.Nlri.(*bgppkt.IPAddrPrefix)
+				if !ok {
+					t.Fatalf("Unexpected NLRI type: %T", path.Nlri)
 				}
-				advertisedPrefix := prefix.Prefix + "/" + fmt.Sprint(prefix.PrefixLen)
+				advertisedPrefix := ipPrefix.Prefix.String()
 				if _, ok := testcase.watchEvents[advertisedPrefix]; !ok {
 					t.Errorf("got unexpected path: %v", advertisedPrefix)
 				}
@@ -2161,9 +2114,12 @@ func Test_syncInternalPeers(t *testing.T) {
 			&NetworkRoutingController{
 				bgpFullMeshMode: true,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer:   gobgp.NewBgpServer(),
 				activeNodes: make(map[string]bool),
@@ -2192,9 +2148,12 @@ func Test_syncInternalPeers(t *testing.T) {
 			&NetworkRoutingController{
 				bgpFullMeshMode: true,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer:   gobgp.NewBgpServer(),
 				activeNodes: make(map[string]bool),
@@ -2237,9 +2196,12 @@ func Test_syncInternalPeers(t *testing.T) {
 			&NetworkRoutingController{
 				bgpFullMeshMode: true,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer: gobgp.NewBgpServer(),
 				activeNodes: map[string]bool{
@@ -2270,9 +2232,12 @@ func Test_syncInternalPeers(t *testing.T) {
 			&NetworkRoutingController{
 				bgpFullMeshMode: false,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer:     gobgp.NewBgpServer(),
 				activeNodes:   make(map[string]bool),
@@ -2333,13 +2298,13 @@ func Test_syncInternalPeers(t *testing.T) {
 				}
 			}()
 
-			startInformersForRoutes(testcase.nrc, testcase.nrc.clientset)
+			startInformersForRoutes(t, testcase.nrc, testcase.nrc.clientset)
 			if err = createNodes(testcase.nrc.clientset, testcase.existingNodes); err != nil {
 				t.Errorf("failed to create existing nodes: %v", err)
 			}
 			waitForListerWithTimeout(testcase.nrc.nodeLister, time.Second*10, t)
 
-			testcase.nrc.syncInternalPeers()
+			require.NoError(t, testcase.nrc.syncInternalPeers())
 
 			neighbors := make(map[string]bool)
 			err = testcase.nrc.bgpServer.ListPeer(context.Background(), &gobgpapi.ListPeerRequest{}, func(peer *gobgpapi.Peer) {
@@ -2382,9 +2347,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				routerID:         testNodeIPv4,
 				bgpServer:        gobgp.NewBgpServer(),
@@ -2412,9 +2380,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				routerID:         testNodeIPv4,
 				bgpServer:        gobgp.NewBgpServer(),
@@ -2442,9 +2413,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				routerID:         testNodeIPv4,
 				bgpServer:        gobgp.NewBgpServer(),
@@ -2472,9 +2446,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				routerID:         testNodeIPv4,
 				bgpServer:        gobgp.NewBgpServer(),
@@ -2502,9 +2479,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer:        gobgp.NewBgpServer(),
 				activeNodes:      make(map[string]bool),
@@ -2531,9 +2511,12 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 				bgpFullMeshMode: false,
 				bgpPort:         10000,
 				clientset:       fake.NewSimpleClientset(),
-				primaryIP:       net.ParseIP(testNodeIPv4),
-				nodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {
-					net.ParseIP(testNodeIPv4)},
+				krNode: &utils.LocalKRNode{
+					KRNode: utils.KRNode{
+						NodeName:      "node-1",
+						PrimaryIP:     net.ParseIP(testNodeIPv4),
+						NodeIPv4Addrs: map[v1core.NodeAddressType][]net.IP{v1core.NodeInternalIP: {net.ParseIP(testNodeIPv4)}},
+					},
 				},
 				bgpServer:        gobgp.NewBgpServer(),
 				activeNodes:      make(map[string]bool),
@@ -2589,7 +2572,342 @@ func Test_routeReflectorConfiguration(t *testing.T) {
 			}
 		})
 	}
+}
 
+func Test_bgpPeerConfigsFromAnnotations(t *testing.T) {
+	testCases := []struct {
+		name             string
+		nodeAnnotations  map[string]string
+		expected         bgp.PeerConfigs
+		errorContains    string
+		errorNotContains string
+	}{
+		{
+			name:            "node annotations are empty",
+			nodeAnnotations: map[string]string{},
+		},
+		{
+			name: "combined bgp peers config annotation",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: 64640
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.1
+- remoteip: 10.0.0.2
+  remoteasn: 64641
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.2`,
+			},
+			expected: func() bgp.PeerConfigs {
+				peer1, _ := bgp.NewPeerConfig("10.0.0.1", 64640, nil, "password", "192.168.0.1", bgp.BFDConfig{})
+				peer2, _ := bgp.NewPeerConfig("10.0.0.2", 64641, nil, "password", "192.168.0.2", bgp.BFDConfig{})
+				return bgp.PeerConfigs{peer1, peer2}
+			}(),
+		},
+		{
+			name: "bgp peers config annotation with bfd",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: 64640
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.1
+  bfd:
+    enabled: true
+    port: 37850
+    detection_multiplier: 2
+    desired_min_tx_interval: 2
+    required_min_rx_interval: 2
+- remoteip: 10.0.0.2
+  remoteasn: 64641
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.2`,
+			},
+			expected: func() bgp.PeerConfigs {
+				peer1, _ := bgp.NewPeerConfig(
+					"10.0.0.1",
+					64640,
+					nil,
+					"password",
+					"192.168.0.1",
+					bgp.BFDConfig{
+						Enabled:               true,
+						Port:                  new(uint32(37850)),
+						DetectionMultiplier:   new(uint32(2)),
+						DesiredMinTxInterval:  new(uint32(2)),
+						RequiredMinRxInterval: new(uint32(2)),
+					},
+				)
+				peer2, _ := bgp.NewPeerConfig("10.0.0.2", 64641, nil, "password", "192.168.0.2", bgp.BFDConfig{})
+				return bgp.PeerConfigs{peer1, peer2}
+			}(),
+		},
+		{
+			name: "combined bgp peers config annotation with mix of local IPs, passwords, and ports being set",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: 64640
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.1
+- remoteip: 10.0.0.2
+  remoteasn: 64641
+  localip: 192.168.0.2
+  port: 180
+- remoteip: 10.0.0.3
+  password: cGFzc3dvcmQ=
+  remoteasn: 64642
+  port: 181`,
+			},
+			expected: func() bgp.PeerConfigs {
+				peer1, err := bgp.NewPeerConfig("10.0.0.1", 64640, nil, "password", "192.168.0.1", bgp.BFDConfig{})
+				if err != nil {
+					t.Fatalf("should not have gotten error constructing PeerConfig but got one: %s", err)
+				}
+				port2 := uint32(180)
+				peer2, err := bgp.NewPeerConfig("10.0.0.2", 64641, &port2, "", "192.168.0.2", bgp.BFDConfig{})
+				if err != nil {
+					t.Fatalf("should not have gotten error constructing PeerConfig but got one: %s", err)
+				}
+				port3 := uint32(181)
+				peer3, err := bgp.NewPeerConfig("10.0.0.3", 64642, &port3, "password", "", bgp.BFDConfig{})
+				if err != nil {
+					t.Fatalf("should not have gotten error constructing PeerConfig but got one: %s", err)
+				}
+				return bgp.PeerConfigs{peer1, peer2, peer3}
+			}(),
+		},
+		{
+			name: "combined bgp peers config annotation with one peer missing remote ip returns error",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: 64640
+  port: 180
+- remoteasn: 64641
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.2`,
+			},
+			errorContains: "remoteip cannot be empty",
+		},
+		{
+			name: "combined bgp peers config annotation with one peer missing remote asn returns error",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: 64640
+  port: 180
+- remoteip: 10.0.0.2
+  password: cGFzc3dvcmQ=
+  localip: 192.168.0.2`,
+			},
+			errorContains: "remoteasn cannot be empty",
+		},
+		{
+			name: "combined bgp peers config annotation with invalid yaml does not leak password",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  password: cGFzc3dvcmQ=
+  remoteasn: [64640`,
+			},
+			errorContains:    "failed to parse " + peersAnnotation + " annotation",
+			errorNotContains: "cGFzc3dvcmQ=",
+		},
+		{
+			name: "combined bgp peers config annotation with invalid field type does not leak password",
+			nodeAnnotations: map[string]string{
+				peersAnnotation: `- remoteip: 10.0.0.1
+  remoteasn: notanumber
+  password: cGFzc3dvcmQ=`,
+			},
+			errorContains:    "failed to parse " + peersAnnotation + " annotation",
+			errorNotContains: "cGFzc3dvcmQ=",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(st *testing.T) {
+			bgpPeerCfgs, err := bgpPeerConfigsFromAnnotations(tc.nodeAnnotations, "")
+			if tc.errorContains != "" {
+				assert.ErrorContains(st, err, tc.errorContains)
+				if tc.errorNotContains != "" {
+					assert.NotContains(st, err.Error(), tc.errorNotContains)
+				}
+			} else {
+				require.NoError(t, err)
+				if !cmp.Equal(tc.expected, bgpPeerCfgs, cmp.AllowUnexported(bgp.PeerConfig{})) {
+					diff := cmp.Diff(tc.expected, bgpPeerCfgs, cmp.AllowUnexported(bgp.PeerConfig{}))
+					t.Errorf("BGP peer config mismatch:\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func Test_bgpPeerConfigsFromIndividualAnnotations(t *testing.T) {
+	// #nosec G101: not real passwords
+	testCases := []struct {
+		name            string
+		nodeAnnotations map[string]string
+		expected        bgp.PeerConfigs
+		errorContains   string
+	}{
+		{
+			name: "individual bgp peers config annotations",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=,cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.1,192.168.0.2",
+				peerPortAnnotation:     "180,181",
+			},
+			expected: func() bgp.PeerConfigs {
+				port1 := uint32(180)
+				port2 := uint32(181)
+				peer1, _ := bgp.NewPeerConfig("10.0.0.1", 64640, &port1, "password", "192.168.0.1", bgp.BFDConfig{})
+				peer2, _ := bgp.NewPeerConfig("10.0.0.2", 64641, &port2, "password", "192.168.0.2", bgp.BFDConfig{})
+				return bgp.PeerConfigs{peer1, peer2}
+			}(),
+		},
+		{
+			name: "individual bgp peers config annotations with some blank passwords",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: ",cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.1,192.168.0.2",
+				peerPortAnnotation:     "180,181",
+			},
+			expected: func() bgp.PeerConfigs {
+				port1 := uint32(180)
+				port2 := uint32(181)
+				peer1, _ := bgp.NewPeerConfig("10.0.0.1", 64640, &port1, "", "192.168.0.1", bgp.BFDConfig{})
+				peer2, _ := bgp.NewPeerConfig("10.0.0.2", 64641, &port2, "password", "192.168.0.2", bgp.BFDConfig{})
+				return bgp.PeerConfigs{peer1, peer2}
+			}(),
+		},
+		{
+			name: "individual bgp peers config annotations without matching number of passwords returns error",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.2,",
+			},
+			errorContains: "The number of passwords should either be zero, or one per peer router.",
+		},
+		{
+			name: "individual bgp peers config annotations without matching number of ports returns error",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=,cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.1,192.168.0.2",
+				peerPortAnnotation:     "180",
+			},
+			errorContains: "The number of ports should either be zero, or one per peer router",
+		},
+		{
+			name: "individual bgp peers config annotations without matching number of local IPs returns error",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=,cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.2",
+				peerPortAnnotation:     "180,181",
+			},
+			errorContains: "The number of localIPs should either be zero, or one per peer router",
+		},
+		{
+			name: "individual bgp peers config annotations without matching number of peer IPs returns error",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1",
+				peerASNAnnotation:      "64640,64641",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=,cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.1,192.168.0.2",
+			},
+			errorContains: "the number of IPs and ASN numbers must be equal",
+		},
+		{
+			name: "individual bgp peers config annotations without matching number of peer ASNs returns error",
+			nodeAnnotations: map[string]string{
+				peerIPAnnotation:       "10.0.0.1,10.0.0.2",
+				peerASNAnnotation:      "64640",
+				peerPasswordAnnotation: "cGFzc3dvcmQ=,cGFzc3dvcmQ=",
+				peerLocalIPAnnotation:  "192.168.0.1,192.168.0.2",
+			},
+			errorContains: "the number of IPs and ASN numbers must be equal",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(st *testing.T) {
+			bgpPeerCfgs, err := bgpPeerConfigsFromAnnotations(tc.nodeAnnotations, "")
+			if tc.errorContains != "" {
+				assert.ErrorContains(st, err, tc.errorContains)
+			} else {
+				require.NoError(t, err)
+				if !cmp.Equal(tc.expected, bgpPeerCfgs, cmp.AllowUnexported(bgp.PeerConfig{})) {
+					diff := cmp.Diff(tc.expected, bgpPeerCfgs, cmp.AllowUnexported(bgp.PeerConfig{}))
+					t.Errorf("BGP peer config mismatch:\n%s", diff)
+				}
+			}
+		})
+	}
+}
+
+func Test_goBGPListenAddrs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name              string
+		adminAddress      string
+		expectedAddresses []string
+	}{
+		{
+			name:              "empty string returns loopback address with port",
+			adminAddress:      "",
+			expectedAddresses: []string{"127.0.0.1:50051"},
+		},
+		{
+			name:              "invalid IP return loopback address with port",
+			adminAddress:      "invalid",
+			expectedAddresses: []string{"127.0.0.1:50051"},
+		},
+		{
+			name:              "IPv4 loopback address returns only loopback address with port",
+			adminAddress:      "127.0.0.1",
+			expectedAddresses: []string{"127.0.0.1:50051"},
+		},
+		{
+			name:              "IPv4 unspecified address returns only unspecified address with port",
+			adminAddress:      "0.0.0.0",
+			expectedAddresses: []string{"0.0.0.0:50051"},
+		},
+		{
+			name:              "IPv6 loopback address returns only loopback address with port",
+			adminAddress:      "::1",
+			expectedAddresses: []string{"[::1]:50051"},
+		},
+		{
+			name:              "IPv6 unspecified only returns only unspecified address with port",
+			adminAddress:      "::",
+			expectedAddresses: []string{"[::]:50051"},
+		},
+		{
+			name:              "IPv4 non-loopback/non-unspecified address returns list of addresses with address and loopback",
+			adminAddress:      "10.0.0.1",
+			expectedAddresses: []string{"10.0.0.1:50051", "127.0.0.1:50051"},
+		},
+		{
+			name:              "IPv6 non-loopback/non-unspecified address returns list of addresses with address and loopback",
+			adminAddress:      "2001:db8::1",
+			expectedAddresses: []string{"[2001:db8::1]:50051", "127.0.0.1:50051"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.expectedAddresses, goBGPListenAddrs(tc.adminAddress, uint16(50051)))
+		})
+	}
 }
 
 /* Disabling test for now. OnNodeUpdate() behaviour is changed. test needs to be adopted.
@@ -2733,7 +3051,7 @@ func Test_OnNodeUpdate(t *testing.T) {
 					Port:     10000,
 				},
 			})
-			testcase.nrc.bgpServerStarted = true
+			testcase.nrc.bgpServerStarted.Store(true)
 			if err != nil {
 				t.Fatalf("failed to start BGP server: %v", err)
 			}
@@ -2761,39 +3079,6 @@ func Test_OnNodeUpdate(t *testing.T) {
 }
 */
 
-func Test_generateTunnelName(t *testing.T) {
-	testcases := []struct {
-		name       string
-		nodeIP     string
-		tunnelName string
-	}{
-		{
-			"IP less than 12 characters after removing '.'",
-			"10.0.0.1",
-			"tun-e443169117a",
-		},
-		{
-			"IP has 12 characters after removing '.'",
-			"100.200.300.400",
-			"tun-9033d7906c7",
-		},
-		{
-			"IPv6 tunnel names are properly handled and consistent",
-			"2001:db8:42:2::/64",
-			"tun-ba56986ef05",
-		},
-	}
-
-	for _, testcase := range testcases {
-		t.Run(testcase.name, func(t *testing.T) {
-			tunnelName := generateTunnelName(testcase.nodeIP)
-			assert.Lessf(t, len(tunnelName), 16, "the maximum length of the tunnel name should never exceed"+
-				"15 characters as 16 characters is the maximum length of a Unix interface name")
-			assert.Equal(t, testcase.tunnelName, tunnelName, "did not get expected tunnel interface name")
-		})
-	}
-}
-
 func createServices(clientset kubernetes.Interface, svcs []*v1core.Service) error {
 	for _, svc := range svcs {
 		_, err := clientset.CoreV1().Services(svc.ObjectMeta.Namespace).Create(context.Background(), svc, metav1.CreateOptions{})
@@ -2816,10 +3101,10 @@ func createNodes(clientset kubernetes.Interface, nodes []*v1core.Node) error {
 	return nil
 }
 
-func createEndpoints(clientset kubernetes.Interface, endpoints []*v1core.Endpoints) error {
-	for _, eps := range endpoints {
-		_, err := clientset.CoreV1().Endpoints(eps.ObjectMeta.Namespace).Create(
-			context.Background(), eps, metav1.CreateOptions{})
+func createEndpointSlices(clientset kubernetes.Interface, endpointSlices []*discoveryv1.EndpointSlice) error {
+	for _, es := range endpointSlices {
+		_, err := clientset.DiscoveryV1().EndpointSlices(es.ObjectMeta.Namespace).Create(
+			context.Background(), es, metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -2828,17 +3113,25 @@ func createEndpoints(clientset kubernetes.Interface, endpoints []*v1core.Endpoin
 	return nil
 }
 
-func startInformersForRoutes(nrc *NetworkRoutingController, clientset kubernetes.Interface) {
+func startInformersForRoutes(t *testing.T, nrc *NetworkRoutingController, clientset kubernetes.Interface) {
+	t.Helper()
 	informerFactory := informers.NewSharedInformerFactory(clientset, 0)
 	svcInformer := informerFactory.Core().V1().Services().Informer()
-	epInformer := informerFactory.Core().V1().Endpoints().Informer()
+	epSliceInformer := informerFactory.Discovery().V1().EndpointSlices().Informer()
 	nodeInformer := informerFactory.Core().V1().Nodes().Informer()
+
+	err := epSliceInformer.AddIndexers(map[string]cache.IndexFunc{
+		indexers.ServiceNameIndex: indexers.ServiceNameIndexFunc,
+	})
+	if err != nil {
+		t.Fatalf("failed to add indexers to endpoint slice informer: %v", err)
+	}
 
 	go informerFactory.Start(nil)
 	informerFactory.WaitForCacheSync(nil)
 
 	nrc.svcLister = svcInformer.GetIndexer()
-	nrc.epLister = epInformer.GetIndexer()
+	nrc.epSliceLister = epSliceInformer.GetIndexer()
 	nrc.nodeLister = nodeInformer.GetIndexer()
 }
 
@@ -2858,6 +3151,34 @@ func waitForListerWithTimeout(lister cache.Indexer, timeout time.Duration, t *te
 	}
 }
 
-func ptrToString(str string) *string {
-	return &str
+func TestAtomicBoolFieldsNoConcurrentDataRace(t *testing.T) {
+	// Verify that bgpServerStarted, initSrcDstCheckDone, and ec2IamAuthorized
+	// can be read and written concurrently without a data race.
+	// This test is only meaningful when run with -race.
+	nrc := &NetworkRoutingController{}
+	nrc.bgpServerStarted.Store(false)
+	nrc.initSrcDstCheckDone.Store(false)
+	nrc.ec2IamAuthorized.Store(true)
+
+	var wg sync.WaitGroup
+
+	// Writers
+	wg.Go(func() {
+		for i := range 1000 {
+			nrc.bgpServerStarted.Store(i%2 == 0)
+			nrc.initSrcDstCheckDone.Store(i%2 == 0)
+			nrc.ec2IamAuthorized.Store(i%2 != 0)
+		}
+	})
+
+	// Readers
+	wg.Go(func() {
+		for range 1000 {
+			_ = nrc.bgpServerStarted.Load()
+			_ = nrc.initSrcDstCheckDone.Load()
+			_ = nrc.ec2IamAuthorized.Load()
+		}
+	})
+
+	wg.Wait()
 }

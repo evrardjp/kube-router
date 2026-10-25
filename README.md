@@ -1,15 +1,24 @@
-<!-- markdownlint-disable-next-line first-line-heading -->
-![logo](https://cdn.rawgit.com/cloudnativelabs/kube-router/64f7700e/Documentation/img/logo-full.svg)
+<!-- markdownlint-disable first-line-heading MD033 -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./docs/img/logo-full-light.svg">
+  <source media="(prefers-color-scheme: light)" srcset="./docs/img/logo-full.svg">
+  <img alt="kube-router" src="./docs/img/logo-full.svg">
+</picture>
+<!-- markdownlint-enable first-line-heading MD033 -->
 
+<!-- markdownlint-capture -->
+<!-- markdownlint-disable MD045 -->
 [![Build Status](https://github.com/cloudnativelabs/kube-router/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/cloudnativelabs/kube-router/actions/workflows/ci.yml?query=branch%3Amaster)
-[![Go Report Card](https://goreportcard.com/badge/github.com/cloudnativelabs/kube-router)](https://goreportcard.com/report/github.com/cloudnativelabs/kube-router)
+[![E2E Network Policy](https://github.com/cloudnativelabs/kube-router/actions/workflows/ci-e2e-netpol.yml/badge.svg?branch=master)](https://github.com/cloudnativelabs/kube-router/actions/workflows/ci-e2e-netpol.yml?query=branch%3Amaster)
+[![golangci-lint](https://img.shields.io/badge/golangci--lint-enabled-brightgreen?logo=go)](https://github.com/cloudnativelabs/kube-router/blob/master/.golangci.yml)
 [![Slack](https://img.shields.io/badge/slack-join%20chat%20%E2%86%92-e01563.svg)](https://kubernetes.slack.com/messages/C8DCQGTSB/)
 [![Docker Pulls kube-router](https://img.shields.io/docker/pulls/cloudnativelabs/kube-router.svg?label=docker+pulls)](https://hub.docker.com/r/cloudnativelabs/kube-router/)
-[![](https://images.microbadger.com/badges/image/cloudnativelabs/kube-router.svg)](https://microbadger.com/images/cloudnativelabs/kube-router)
 [![](https://img.shields.io/github/release/cloudnativelabs/kube-router/all.svg?style=flat-square)](https://github.com/cloudnativelabs/kube-router/releases)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/cloudnativelabs/kube-router/badge)](https://scorecard.dev/viewer/?uri=github.com/cloudnativelabs/kube-router)
+<!-- markdownlint-restore -->
 
-Kube-router is a turnkey solution for Kubernetes networking with aim to provide operational simplicity and high performance.
+kube-router is a turnkey solution for Kubernetes networking with the aim to provide operational simplicity and high performance.
 
 ## Primary Features
 
@@ -21,9 +30,11 @@ single DaemonSet/Binary. It doesn't get any easier.
 
 ### IPVS/LVS based service proxy | `--run-service-proxy`
 
-kube-router uses the Linux kernel's LVS/IPVS features to implement its K8s Services Proxy. Kube-router fully leverages
+kube-router uses the Linux kernel's LVS/IPVS features to implement its K8s Services Proxy. kube-router fully leverages
 power of LVS/IPVS to provide a rich set of scheduling options and unique features like DSR (Direct Server Return), L3
 load balancing with ECMP for deployments where high throughput, minimal latency and high-availability are crucial.
+Kube-router also provides built-in validation of externalIPs and loadBalancerIPs against configured CIDR ranges,
+preventing unauthorized VIP bindings in multi-tenant clusters.
 
 Read more about the advantages of IPVS for container load balancing:
 
@@ -54,30 +65,39 @@ is easy with kube-router -- just add a flag to kube-router. It uses ipsets with
 iptables to ensure your firewall rules have as little performance impact on your
 cluster as possible.
 
-Kube-router supports the networking.k8s.io/NetworkPolicy API or network policy V1/GA
-[semantics](https://github.com/kubernetes/kubernetes/pull/39164#issue-197243974) and also network policy beta semantics.
+kube-router supports the networking.k8s.io/NetworkPolicy API or network policy V1/GA
+[semantics](https://github.com/kubernetes/kubernetes/pull/39164#issue-197243974).
 
 Read more about kube-router's approach to Kubernetes Network Policies:
 
 - [Enforcing Kubernetes network policies with iptables](https://cloudnativelabs.github.io/post/2017-05-1-kube-network-policies/)
+
+### LoadBalancer IP Allocator | `--run-loadbalancer`
+
+kube-router includes a built-in LoadBalancer IP address allocator for environments where an external cloud load balancer
+is not available, such as bare-metal or on-premise clusters. It watches for Services of type `LoadBalancer` and assigns
+IP addresses from a configurable pool. When combined with `--advertise-loadbalancer-ip` and BGP peering, these addresses
+are reachable from outside the cluster.
+
+For more details please refer to the [LoadBalancer Allocator documentation](docs/load-balancer-allocator.md).
 
 ### Advanced BGP Capabilities
 
 If you have other networking devices or SDN systems that talk BGP, kube-router will fit in perfectly. From a simple full
 node-to-node mesh to per-node peering configurations, most routing needs can be attained. The configuration is
 Kubernetes native (annotations) just like the rest of kube-router, so use the tools you already know! Since kube-router
-uses GoBGP, you have access to a modern BGP API platform as well right out of the box. Kube-router also provides a way
-to expose services outside the cluster by advertising ClusterIP and externalIPs to configured BGP peers. Kube-routesalso
-support MD5 password based authentication and uses strict export policies so you can be assured routes are advertised to
+uses GoBGP, you have access to a modern BGP API platform as well right out of the box. kube-router also provides a way
+to expose services outside the cluster by advertising ClusterIP and externalIPs to configured BGP peers. kube-router also
+supports MD5 password based authentication and uses strict export policies so you can be assured routes are advertised to
 the underlay only as you intended.
 
 For more details please refer to the [BGP documentation](docs/bgp.md).
 
 ### Standard Linux Networking
 
-A key design tenet of Kube-router is to use standard Linux networking stack and toolset. There is no overlays or SDN
+A key design tenet of kube-router is to use standard Linux networking stack and toolset. There are no overlays or SDN
 pixie dust, but just plain good old networking. You can use standard Linux networking tools like iptables, ipvsadm,
-ipset, iproute, traceroute, tcpdump etc. to troubleshoot or observe data path. When kube-router is ran as a daemonset,
+ipset, iproute, traceroute, tcpdump etc. to troubleshoot or observe data path. When kube-router is run as a daemonset,
 the official kube-router image also ships with these [tools](./docs/pod-toolbox.md#pod-toolbox) automatically configured
 for your cluster.
 
@@ -85,7 +105,7 @@ for your cluster.
 
 Although it does the work of several of its peers in one binary, kube-router does it all with a relatively
 [tiny codebase](https://github.com/cloudnativelabs/kube-router/tree/master/pkg/controllers), partly because IPVS is
-already there on your Kuberneres nodes waiting to help you do amazing things. kube-router brings that and GoBGP's modern
+already there on your Kubernetes nodes waiting to help you do amazing things. kube-router brings that and GoBGP's modern
 BGP interface to you in an elegant package designed from the ground up for Kubernetes.
 
 ### High Performance
@@ -99,13 +119,13 @@ optimized.
 
 - [How it Works](./docs/how-it-works.md)
 - [Architecture](./docs/architecture.md)
-- [See Kube-router in action](./docs/see-it-in-action.md)
+- [See kube-router in action](./docs/see-it-in-action.md)
 - [User Guide](./docs/user-guide.md)
 - [Developer Guide](./docs/developing.md)
 
 ## Project status
 
-Kube-router is being used in several production clusters by diverse set of users ranging from financial firms, gaming
+kube-router is being used in several production clusters by a diverse set of users ranging from financial firms, gaming
 companies to universities. For years we have listened to users and incorporated feedback. The core functionality is now
 very stable.
 
@@ -117,14 +137,28 @@ typos, tests — anything at all. Please read the [contribution guide](./CON
 ## Support & Feedback
 
 If you experience any problems please reach us on kube-router [slack channel](https://kubernetes.slack.com/messages/C8DCQGTSB/)
-for quick help. Feel free to leave feedback or raise questions by opening an issue [here](https://github.com/cloudnativelabs/kube-router/issues).
+for quick help. Feel free to leave feedback or raise questions by [opening an issue](https://github.com/cloudnativelabs/kube-router/issues).
 
 ## Acknowledgement
 
-Kube-router build upon following libraries:
+kube-router builds upon the following libraries:
 
 - [iptables](https://github.com/coreos/go-iptables)
 - [GoBGP](https://github.com/osrg/gobgp)
 - [Netlink](https://github.com/vishvananda/netlink)
-- [ipset](https://github.com/janeczku/go-ipset)
-- [IPVS](https://github.com/docker/libnetwork/)
+- [IPVS](https://github.com/moby/ipvs)
+
+Thanks to following projects for supporting kube-router through their open source programs!
+
+<!-- markdownlint-disable MD033 -->
+<a href="https://www.blacksmith.sh">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/blacksmith-ci-logo.png">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/img/blacksmith-ci-logo-light.png">
+    <img alt="CI powered by Blacksmith" src="./docs/img/blacksmith-ci-logo-light.png" width="368"></picture></a>
+<a href="https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./docs/img/greptile-logo.png">
+    <source media="(prefers-color-scheme: light)" srcset="./docs/img/greptile-logo-light.png">
+    <img alt="Reviews powered by Greptile" src="./docs/img/greptile-logo-light.png" width="368"></picture></a>
+<!-- markdownlint-enable MD033 -->

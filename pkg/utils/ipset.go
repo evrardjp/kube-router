@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"sort"
+	"slices"
 	"strings"
 
 	"k8s.io/klog/v2"
@@ -20,14 +20,14 @@ var (
 )
 
 const (
-	// FamillyInet IPV4.
-	FamillyInet = "inet"
-	// FamillyInet6 IPV6.
-	FamillyInet6 = "inet6"
+	// FamilyInet IPV4.
+	FamilyInet = "inet"
+	// FamilyInet6 IPV6.
+	FamilyInet6 = "inet6"
 
 	// DefaultMaxElem Default OptionMaxElem value.
 	DefaultMaxElem = "65536"
-	// DefaultHasSize Defaul OptionHashSize value.
+	// DefaultHasSize Default OptionHashSize value.
 	DefaultHasSize = "1024"
 
 	// TypeHashIP The hash:ip set type uses a hash to store IP host addresses (default) or network addresses. Zero
@@ -78,7 +78,7 @@ const (
 	// set. The timeout value of already added elements can be changed by readding the element using the -exist option.
 	// When listing the set, the number of entries printed in the header might be larger than the listed number of
 	// entries for sets with the timeout extensions: the number of entries in the set is updated when elements
-	// added/deleted to the set and periodically when the garbage colletor evicts the timed out entries.
+	// added/deleted to the set and periodically when the garbage collector evicts the timed out entries.
 	OptionTimeout = "timeout"
 	// OptionCounters All set types support the optional counters option when creating a set. If the option is specified
 	// then the set is created with packet and byte counters per element support. The packet and byte counters are
@@ -134,9 +134,9 @@ const (
 	// OptionMaxElem This parameter is valid for the create command of all hash type sets. It does define the maximal
 	// number of elements which can be stored in the set, default 65536.
 	OptionMaxElem = "maxelem"
-	// OptionFamilly This parameter is valid for the create command of all hash type sets except for hash:mac. It
+	// OptionFamily This parameter is valid for the create command of all hash type sets except for hash:mac. It
 	// defines the protocol family of the IP addresses to be stored in the set. The default is inet, i.e IPv4.
-	OptionFamilly = "family"
+	OptionFamily = "family"
 	// OptionNoMatch The hash set types which can store net type of data (i.e. hash:*net*) support the optional nomatch
 	// option when adding entries. When matching elements in the set, entries marked as nomatch are skipped as if those
 	// were not added to the set, which makes possible to build up sets with exceptions. See the example at hash type
@@ -163,6 +163,7 @@ type IPSetHandler interface {
 	DestroyAllWithin() error
 	Save() error
 	Restore() error
+	RestoreSets([]string) error
 	Flush() error
 	Get(setName string) *Set
 	Sets() map[string]*Set
@@ -298,7 +299,7 @@ func (ipset *IPSet) Create(setName string, createOptions ...string) (*Set, error
 		klog.V(2).Infof("running ipset command: %s", args)
 		_, err := ipset.run(args...)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create ipset set on system: %s", err)
+			return nil, fmt.Errorf("failed to create ipset set on system: %w", err)
 		}
 	}
 	return ipset.sets[ipsetName], nil
@@ -510,18 +511,36 @@ func scrubInitValFromOptions(options []string) []string {
 	return options
 }
 
+// BuildIPSetRestore creates a set of ipset rules that can be fed into ipset restore. ipset contains a list of "sets"
+// that we will act on. If setIncludeNames is not null, then the list of sets will be dynamically filtered to ensure
+// that the string for ipset restore only includes sets with those names.
+//
+// In order to ensure that our changes are atomic, we create a temporary set per unique ipset options, then we load
+// that temporary set with the new list of entries, then we swap them to the final name of the set, and then flush the
+// temporary set before potentially reusing it in a future load.
+//
+// The temporary set is created only as needed to ensure that we don't needlessly create temporary sets. Temporary sets
+// have to be unique to the "Type" of the set. This is things like: hash:ip and others.
+//
 // Build ipset restore input
 // ex:
 // create KUBE-DST-3YNVZWWGX3UQQ4VQ hash:ip family inet hashsize 1024 maxelem 65536 timeout 0
 // add KUBE-DST-3YNVZWWGX3UQQ4VQ 100.96.1.6 timeout 0
-func buildIPSetRestore(ipset *IPSet) string {
+func BuildIPSetRestore(ipset *IPSet, setIncludeNames []string) string {
 	setNames := make([]string, 0, len(ipset.sets))
 	for setName := range ipset.sets {
+		// If we've been passed a set of filter names, check to see if this set is contained within that set before
+		// adding it to the restore to ensure that we don't impact other unrelated sets
+		if setIncludeNames != nil {
+			if !slices.Contains(setIncludeNames, setName) {
+				continue
+			}
+		}
 		// we need setNames in some consistent order so that we can unit-test this method has a predictable output:
 		setNames = append(setNames, setName)
 	}
 
-	sort.Strings(setNames)
+	slices.Sort(setNames)
 
 	tmpSets := map[string]string{}
 	ipSetRestore := &strings.Builder{}
@@ -535,26 +554,26 @@ func buildIPSetRestore(ipset *IPSet) string {
 			//nolint:gosec // we don't use this hash in a sensitive capacity, so we don't care that its weak
 			hash := sha1.Sum([]byte("tmp:" + setOptions))
 			tmpSetName = tmpIPSetPrefix + base32.StdEncoding.EncodeToString(hash[:10])
-			ipSetRestore.WriteString(fmt.Sprintf("create %s %s\n", tmpSetName, setOptions))
+			fmt.Fprintf(ipSetRestore, "create %s %s\n", tmpSetName, setOptions)
 			// just in case we are starting up after a crash, we should flush the TMP ipset to be safe if it
 			// already existed, so we do not pollute other ipsets:
-			ipSetRestore.WriteString(fmt.Sprintf("flush %s\n", tmpSetName))
+			fmt.Fprintf(ipSetRestore, "flush %s\n", tmpSetName)
 			tmpSets[setOptions] = tmpSetName
 		}
 
 		for _, entry := range set.Entries {
 			// add entries to the tmp set:
-			ipSetRestore.WriteString(fmt.Sprintf("add %s %s\n", tmpSetName, strings.Join(entry.Options, " ")))
+			fmt.Fprintf(ipSetRestore, "add %s %s\n", tmpSetName, strings.Join(entry.Options, " "))
 		}
 
 		// now create the actual IPSet (this is a noop if it already exists, because we run with -exists):
-		ipSetRestore.WriteString(fmt.Sprintf("create %s %s\n", set.Name, setOptions))
+		fmt.Fprintf(ipSetRestore, "create %s %s\n", set.Name, setOptions)
 
 		// now that both exist, we can swap them:
-		ipSetRestore.WriteString(fmt.Sprintf("swap %s %s\n", tmpSetName, set.Name))
+		fmt.Fprintf(ipSetRestore, "swap %s %s\n", tmpSetName, set.Name)
 
 		// empty the tmp set (which is actually the old one now):
-		ipSetRestore.WriteString(fmt.Sprintf("flush %s\n", tmpSetName))
+		fmt.Fprintf(ipSetRestore, "flush %s\n", tmpSetName)
 	}
 
 	setsToDestroy := make([]string, 0, len(tmpSets))
@@ -562,10 +581,10 @@ func buildIPSetRestore(ipset *IPSet) string {
 		setsToDestroy = append(setsToDestroy, tmpSetName)
 	}
 	// need to destroy the sets in a predictable order for unit test!
-	sort.Strings(setsToDestroy)
+	slices.Sort(setsToDestroy)
 	for _, tmpSetName := range setsToDestroy {
 		// finally, destroy the tmp sets.
-		ipSetRestore.WriteString(fmt.Sprintf("destroy %s\n", tmpSetName))
+		fmt.Fprintf(ipSetRestore, "destroy %s\n", tmpSetName)
 	}
 
 	return ipSetRestore.String()
@@ -591,7 +610,14 @@ func (ipset *IPSet) Save() error {
 // mode except list, help, version, interactive mode and restore itself.
 // Send formatted ipset.sets into stdin of "ipset restore" command.
 func (ipset *IPSet) Restore() error {
-	restoreString := buildIPSetRestore(ipset)
+	return ipset.RestoreSets(nil)
+}
+
+// RestoreSets is very similar to Restore, except that it filters by set names that are passed in a string array
+// so that we don't disrumpt other things that might be using ipsets on the host. In general, this function should be
+// preferred over the Restore() function.
+func (ipset *IPSet) RestoreSets(setNames []string) error {
+	restoreString := BuildIPSetRestore(ipset, setNames)
 	klog.V(3).Infof("ipset (ipv6? %t) restore looks like:\n%s", ipset.isIpv6, restoreString)
 	stdin := bytes.NewBufferString(restoreString)
 	err := ipset.runWithStdin(stdin, "restore", "-exist")
@@ -623,4 +649,13 @@ func (ipset *IPSet) Get(setName string) *Set {
 // Sets returns all sets from ipset
 func (ipset *IPSet) Sets() map[string]*Set {
 	return ipset.sets
+}
+
+func GenerateMultiFamilySetNames(setNames []string) []string {
+	multiFamilySetNames := make([]string, 0, len(setNames))
+	for _, setName := range setNames {
+		multiFamilySetNames = append(multiFamilySetNames, setName)
+		multiFamilySetNames = append(multiFamilySetNames, IPSetName(setName, true))
+	}
+	return multiFamilySetNames
 }

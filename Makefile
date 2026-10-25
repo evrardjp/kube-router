@@ -17,21 +17,43 @@ DOCKER=$(if $(or $(IN_DOCKER_GROUP),$(IS_ROOT),$(OSX)),docker,sudo docker)
 MAKEFILE_DIR=$(dir $(realpath $(firstword $(MAKEFILE_LIST))))
 UPSTREAM_IMPORT_PATH=$(GOPATH)/src/github.com/cloudnativelabs/kube-router/
 BUILD_IN_DOCKER?=true
-DOCKER_BUILD_IMAGE?=golang:1.21.7-alpine3.19
+# See Versions: https://hub.docker.com/_/golang
+DOCKER_BUILD_IMAGE?=golang:1.26.10-alpine3.24@sha256:5cb67f19c5e7994dcb80c074f7cfca8aeeada45bbdca035f73df269cefdcce61
 ## These variables are used by the Dockerfile as the bases for building and creating the runtime container
 ## During CI these come from .github/workflows/ci.yaml below we define for local builds as well
 GO_CACHE?=$(shell go env GOCACHE)
 GO_MOD_CACHE?=$(shell go env GOMODCACHE)
 BUILDTIME_BASE?=$(DOCKER_BUILD_IMAGE)
-RUNTIME_BASE?=alpine:3.19
-DOCKER_LINT_IMAGE?=golangci/golangci-lint:v1.56.2
-DOCKER_MARKDOWNLINT_IMAGE?=tmknom/markdownlint:0.39.0
-GOBGP_VERSION=v3.23.0
-QEMU_IMAGE?=multiarch/qemu-user-static
-GORELEASER_VERSION=v1.24.0
-MOQ_VERSION=v0.3.4
-CNI_VERSION=v1.4.0
+# See Versions: https://hub.docker.com/_/alpine
+RUNTIME_BASE?=alpine:3.24.3@sha256:b3413572228e34bd1c9245f5565e6cd127005655e8a7899aef33d8e83255c9e6
+# See Versions: https://hub.docker.com/r/golangci/golangci-lint/tags
+DOCKER_LINT_IMAGE?=golangci/golangci-lint:v2.12.2@sha256:5cceeef04e53efe1470638d4b4b4f5ceefd574955ab3941b2d9a68a8c9ad5240
+# See Versions: https://hub.docker.com/r/tmknom/markdownlint/tags
+DOCKER_MARKDOWNLINT_IMAGE?=tmknom/markdownlint:0.45.0@sha256:a9509a9d50a82781aa4cd0a48f182da55233071fb19454bc70cecc2782359c3c
+# See Versions: https://hub.docker.com/_/node
+DOCKER_DOCTOC_IMAGE?=node:alpine@sha256:40cd011b55415bc894e45b02fdd5a5dfde056921b7d23a64c74f80497af48797
+# See Versions: https://www.npmjs.com/package/doctoc
+DOCTOC_VERSION=2.5.0
+# See Versions: https://github.com/crate-ci/typos/releases
+TYPOS_VERSION=v1.49.0
+# See Versions: https://github.com/osrg/gobgp/releases
+GOBGP_VERSION=da824d99912e02124b53741245ee4186c381adcc  # v4.10.0
+QEMU_IMAGE?=multiarch/qemu-user-static:7.2.0-1@sha256:fe60359c92e86a43cc87b3d906006245f77bfc0565676b80004cc666e4feb9f0
+# See Versions: https://github.com/goreleaser/goreleaser/releases
+GORELEASER_VERSION=v2.17.1
+# See Versions: https://hub.docker.com/r/anchore/grype/tags
+GRYPE_IMAGE?=anchore/grype:v0.117.0@sha256:ddf9e9f204049f3a4a0955ef70873cabab6a31432125ad4f20a490b54950a253
+# See Versions: https://github.com/containernetworking/plugins/releases
+CNI_VERSION=v1.9.1
 UID?=$(shell id -u)
+# e2e-netpol target parameters (passed through to hack/e2e-netpol.sh)
+BACKEND?=iptables
+DEFAULT_DENY?=false
+SKIP_CLEANUP?=0
+E2E_LONG?=
+E2E_PROCS?=4
+E2E_FOCUS?=
+E2E_SKIP?=
 ifeq ($(GOARCH), arm)
 ARCH_TAG_PREFIX=$(GOARCH)
 FILE_ARCH=ARM
@@ -58,7 +80,7 @@ FILE_ARCH=x86-64
 DOCKER_ARCH=
 endif
 $(info Building for GOARCH=$(GOARCH))
-all: lint test kube-router container ## Default target. Lints code, runs tests, builds binaries and images.
+all: doctoc lint test-pretty kube-router container ## Default target. Lints code, runs tests, builds binaries and images.
 
 kube-router:
 	@echo Starting kube-router binary build.
@@ -85,12 +107,51 @@ ifeq "$(BUILD_IN_DOCKER)" "true"
 		-v $(GO_MOD_CACHE):/go/pkg/mod \
 		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
 		sh -c \
-		'CGO_ENABLED=0 go test -v -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/pkg/...'
+		'CGO_ENABLED=0 go test -v -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/...'
 else
-	go test -v -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/pkg/...
+	go test -v -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/...
 endif
 
-lint: gofmt markdownlint
+test-privileged: ## Runs only privileged tests (netlink, netns, etc) that require root. Use Docker or run as root.
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run --privileged -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
+		-v $(GO_CACHE):/root/.cache/go-build \
+		-v $(GO_MOD_CACHE):/go/pkg/mod \
+		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
+		sh -c \
+		'CGO_ENABLED=0 go test -v -timeout 30s -tags privileged -run "^TestPrivileged" $$(find . -name "*_privileged_test.go" -exec dirname {} + | sort -u)'
+else
+	go test -v -timeout 30s -tags privileged -run '^TestPrivileged' $$(find . -name '*_privileged_test.go' -exec dirname {} + | sort -u)
+endif
+
+test-integration: ## Runs nftables integration tests in a privileged container. Set BUILD_IN_DOCKER=false to run bare (requires root and nft).
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run --privileged -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
+		-v $(GO_CACHE):/root/.cache/go-build \
+		-v $(GO_MOD_CACHE):/go/pkg/mod \
+		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
+		sh -c \
+		'apk add --no-cache nftables >/dev/null && CGO_ENABLED=0 go test -v -timeout 60s -tags integration -run "^TestIntegration" github.com/cloudnativelabs/kube-router/v2/pkg/controllers/netpol/...'
+else
+	go test -v -timeout 60s -tags integration -run '^TestIntegration' \
+		github.com/cloudnativelabs/kube-router/v2/pkg/controllers/netpol/...
+endif
+
+test-all: test test-privileged test-integration ## Runs every host-local test level (unit, privileged, nftables integration). The e2e suite is separate; compose with: make test-all e2e-netpol
+
+test-pretty: gofmt ## Runs code quality pipelines (gofmt, tests, coverage, etc)
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
+		-v $(GO_CACHE):/root/.cache/go-build \
+		-v $(GO_MOD_CACHE):/go/pkg/mod \
+		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
+		sh -c \
+		'CGO_ENABLED=0 go tool gotestsum --format gotestdox -- -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/...'
+else
+	go tool gotestsum --format gotestdox -- -timeout 30s github.com/cloudnativelabs/kube-router/v2/cmd/kube-router/ github.com/cloudnativelabs/kube-router/v2/...
+endif
+
+lint: gofmt markdownlint spellcheck
 ifeq "$(BUILD_IN_DOCKER)" "true"
 	$(DOCKER) run -v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
 		-v $(GO_CACHE):/root/.cache/go-build \
@@ -104,6 +165,13 @@ endif
 
 markdownlint:
 	$(DOCKER) run -v $(PWD):/work $(DOCKER_MARKDOWNLINT_IMAGE) -- README.md docs
+
+doctoc: ## Regenerates table of contents in docs that have doctoc markers.
+	$(DOCKER) run --rm -v $(PWD):/work -w /work $(DOCKER_DOCTOC_IMAGE) npx doctoc@$(DOCTOC_VERSION) docs/ --github --maxlevel 3 --notitle --update-only
+
+spellcheck: ## Checks for spelling mistakes in code and documentation.
+	$(DOCKER) run --rm -v $(PWD):/work -w /work $(RUNTIME_BASE) sh -c \
+		'wget -qO- https://github.com/crate-ci/typos/releases/download/$(TYPOS_VERSION)/typos-$(TYPOS_VERSION)-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin && typos'
 
 run: kube-router ## Runs "kube-router --help".
 	./kube-router --help
@@ -120,6 +188,20 @@ container: kube-router gobgp multiarch-binverify cni-download ## Builds a Docker
 		$(DOCKER) tag "$(REGISTRY_DEV):$(IMG_TAG)" "$(REGISTRY_DEV)"; \
 	fi
 	@echo Finished kube-router container image build.
+
+scan: container ## Scans the locally built container image for HIGH and CRITICAL CVEs using Grype.
+	@echo Starting CVE scan of $(REGISTRY_DEV):$(subst /,,$(IMG_TAG))
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run --rm \
+		-v /var/run/docker.sock:/var/run/docker.sock \
+		-v $(PWD):/work \
+		-w /work \
+		$(GRYPE_IMAGE) \
+		"$(REGISTRY_DEV):$(subst /,,$(IMG_TAG))" --fail-on high
+else
+	grype "$(REGISTRY_DEV):$(subst /,,$(IMG_TAG))" --fail-on high
+endif
+	@echo Finished CVE scan.
 
 docker-login: ## Logs into a docker registry using {DOCKER,QUAY}_{USERNAME,PASSWORD} variables.
 	@echo Starting docker login target.
@@ -138,7 +220,7 @@ docker-login: ## Logs into a docker registry using {DOCKER,QUAY}_{USERNAME,PASSW
 
 push: container docker-login ## Pushes a Docker container image to a registry.
 	@echo Starting kube-router container image push.
-	$(DOCKER) push "$(REGISTRY_DEV):$(IMG_TAG)"
+	$(DOCKER) push "$(REGISTRY_DEV):$(subst /,,$(IMG_TAG))"
 	@echo Finished kube-router container image push.
 
 push-manifest:
@@ -189,10 +271,11 @@ gofmt: ## Tells you what files need to be gofmt'd.
 
 gofmt-fix: ## Fixes files that need to be gofmt'd.
 	gofmt -s -w $(shell find . -not \( \( -wholename '*/vendor/*' \) -prune \) -name '*.go')
+	goimports -w $(shell find . -not \( \( -wholename '*/vendor/*' \) -prune \) -name '*.go')
 
 # List of all file_moq.go files which would need to be regenerated
 # from file.go if changed
-gomoqs: ./pkg/controllers/proxy/linux_networking_moq.go
+gomoqs: ./pkg/controllers/proxy/linux_networking_moq.go ./pkg/utils/iptables_moq.go
 
 # file_moq.go file is generated from file.go "//go:generate moq ..." in-file
 # annotation, as it needs to know which interfaces to create mock stubs for
@@ -203,9 +286,8 @@ ifeq "$(BUILD_IN_DOCKER)" "true"
 		-v $(GO_CACHE):/root/.cache/go-build \
 		-v $(GO_MOD_CACHE):/go/pkg/mod \
 		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
-		sh -c 'go install github.com/matryer/moq@$(MOQ_VERSION) && go generate -v $(*).go && chown $(UID) $(*)_moq.go'
+		sh -c 'go generate -v $(*).go && chown $(UID) $(*)_moq.go'
 else
-	@test -x $(lastword $(subst :, ,$(GOPATH)))/bin/moq && exit 0; echo "ERROR: 'moq' tool is needed to update mock test files, install it with: \ngo get github.com/matryer/moq\n"; exit 1
 	go generate -v $(*).go
 endif
 
@@ -217,9 +299,9 @@ ifeq "$(BUILD_IN_DOCKER)" "true"
 		-v $(GO_MOD_CACHE):/go/pkg/mod \
 		-w /go/src/github.com/cloudnativelabs/kube-router $(DOCKER_BUILD_IMAGE) \
 		sh -c \
-		'CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go install github.com/osrg/gobgp/v3/cmd/gobgp@$(GOBGP_VERSION) && if [ ${GOARCH} != $$(go env GOHOSTARCH) ]; then PREFIX=linux_${GOARCH}; fi && cp $$(go env GOPATH)/bin/$${PREFIX}/gobgp .'
+		'CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go install github.com/osrg/gobgp/v4/cmd/gobgp@$(GOBGP_VERSION) && if [ ${GOARCH} != $$(go env GOHOSTARCH) ]; then PREFIX=linux_${GOARCH}; fi && cp $$(go env GOPATH)/bin/$${PREFIX}/gobgp .'
 else
-	CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go install github.com/osrg/gobgp/v3/cmd/gobgp@$(GOBGP_VERSION) && if [ ${GOARCH} != $$(go env GOHOSTARCH) ]; then PREFIX=linux_${GOARCH}; fi && cp $$(go env GOPATH)/bin/$${PREFIX}/gobgp .
+	CGO_ENABLED=0 GOARCH=$(GOARCH) GOOS=linux go install github.com/osrg/gobgp/v4/cmd/gobgp@$(GOBGP_VERSION) && if [ ${GOARCH} != $$(go env GOHOSTARCH) ]; then PREFIX=linux_${GOARCH}; fi && cp $$(go env GOPATH)/bin/$${PREFIX}/gobgp .
 endif
 	@echo Finished building gobgp.
 
@@ -235,13 +317,56 @@ cni-download:
 		tar -xf cni-plugins-$(GOARCH).tgz -C cni-download
 		rm -f cni-plugins-$(GOARCH).tgz
 
+update-deps: ## Updates all dependency versions, resolves digests, and pins SHAs.
+	@echo Starting dependency update.
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run --rm \
+		-v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
+		-v $(GO_CACHE):/root/.cache/go-build \
+		-v $(GO_MOD_CACHE):/go/pkg/mod \
+		-w /go/src/github.com/cloudnativelabs/kube-router/build/dependency-updater \
+		-e GITHUB_TOKEN=$(GITHUB_TOKEN) \
+		-e GH_TOKEN=$(GH_TOKEN) \
+		$(DOCKER_BUILD_IMAGE) \
+		sh -c 'go run . --all --project-root=/go/src/github.com/cloudnativelabs/kube-router'
+else
+	cd $(MAKEFILE_DIR)build/dependency-updater && go run . --all --project-root=$(MAKEFILE_DIR)
+endif
+	@echo Finished dependency update.
+
+update-deps-dry: ## Shows what dependency updates would be made without applying them.
+	@echo Starting dependency update dry-run.
+ifeq "$(BUILD_IN_DOCKER)" "true"
+	$(DOCKER) run --rm \
+		-v $(PWD):/go/src/github.com/cloudnativelabs/kube-router \
+		-v $(GO_CACHE):/root/.cache/go-build \
+		-v $(GO_MOD_CACHE):/go/pkg/mod \
+		-w /go/src/github.com/cloudnativelabs/kube-router/build/dependency-updater \
+		-e GITHUB_TOKEN=$(GITHUB_TOKEN) \
+		-e GH_TOKEN=$(GH_TOKEN) \
+		$(DOCKER_BUILD_IMAGE) \
+		sh -c 'go run . --all --dry-run --project-root=/go/src/github.com/cloudnativelabs/kube-router'
+else
+	cd $(MAKEFILE_DIR)build/dependency-updater && go run . --all --dry-run --project-root=$(MAKEFILE_DIR)
+endif
+	@echo Finished dependency update dry-run.
+
+prep-release: update-deps doctoc lint test-pretty kube-router container scan ## Prepares for a release: updates deps, runs all checks, builds, and scans for CVEs.
+	@echo Finished prep-release. Review any dependency changes and commit before tagging.
+
 # http://marmelab.com/blog/2016/02/29/auto-documented-makefile.html
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-22s\033[0m %s\n", $$1, $$2}'
 
-.PHONY: clean container run release goreleaser push gofmt gofmt-fix gomoqs
-.PHONY: test lint docker-login push-manifest push-manifest-release
-.PHONY: push-release github-release help multiarch-binverify markdownlint
+e2e-netpol: ## Run the kube-router NetworkPolicy e2e suite locally (requires docker + kind). Pass BACKEND=nftables, DEFAULT_DENY=true, SKIP_CLEANUP=1, E2E_LONG=1, E2E_PROCS=N, E2E_FOCUS/E2E_SKIP=regex as needed.
+	BACKEND=$(BACKEND) DEFAULT_DENY=$(DEFAULT_DENY) SKIP_CLEANUP=$(SKIP_CLEANUP) E2E_LONG=$(E2E_LONG) \
+		E2E_PROCS=$(E2E_PROCS) E2E_FOCUS=$(E2E_FOCUS) E2E_SKIP=$(E2E_SKIP) \
+		hack/e2e-netpol.sh all
+
+.PHONY: clean container run release goreleaser push gofmt gofmt-fix gomoqs scan
+.PHONY: test test-privileged test-integration test-all test-pretty lint docker-login push-manifest push-manifest-release
+.PHONY: push-release github-release help multiarch-binverify markdownlint doctoc
+.PHONY: spellcheck update-deps update-deps-dry prep-release kube-router gobgp cni-download e2e-netpol
 
 .DEFAULT: all

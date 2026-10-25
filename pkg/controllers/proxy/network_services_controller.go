@@ -1,27 +1,35 @@
 package proxy
 
 import (
-	"crypto/rand"
+	"cmp"
+	"context"
 	"errors"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/ccoveille/go-safecast/v2"
+	"github.com/cloudnativelabs/kube-router/v2/internal/nlretry"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/metrics"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/options"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/svcip"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/moby/ipvs"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	v1 "k8s.io/api/core/v1"
-	discovery "k8s.io/api/discovery/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
@@ -32,20 +40,20 @@ const (
 	KubeDummyIf       = "kube-dummy-if"
 	KubeTunnelIfv4    = "kube-tunnel-if"
 	KubeTunnelIfv6    = "kube-tunnel-v6"
-	IfaceNotFound     = "Link not found"
-	IfaceHasAddr      = "file exists"
+	KubeBridgeIf      = "kube-bridge"
 	IfaceHasNoAddr    = "cannot assign requested address"
-	IpvsServerExists  = "file exists"
 	IpvsMaglevHashing = "mh"
 	IpvsSvcFSched1    = "flag-1"
 	IpvsSvcFSched2    = "flag-2"
 	IpvsSvcFSched3    = "flag-3"
 
-	customDSRRouteTableID    = "78"
-	customDSRRouteTableName  = "kube-router-dsr"
-	externalIPRouteTableID   = "79"
-	externalIPRouteTableName = "external_ip"
-	kubeRouterProxyName      = "kube-router"
+	customDSRRouteTableID              = 78
+	customDSRRouteTableName            = "kube-router-dsr"
+	externalIPRouteTableID             = 79
+	externalIPRouteTableName           = "external_ip"
+	kubeRouterProxyName                = "kube-router"
+	defaultTrafficDirectorRulePriority = 32764
+	defaultDSRPolicyRulePriority       = 32765
 
 	// Taken from https://github.com/torvalds/linux/blob/master/include/uapi/linux/ip_vs.h#L21
 	ipvsPersistentFlagHex = 0x0001
@@ -76,7 +84,7 @@ const (
 
 	// kubernetes standard labels / annotations
 	svcProxyNameLabel = "service.kubernetes.io/service-proxy-name"
-	svcHeadlessLabel  = "service.kubernetes.io/headless"
+	headlessLabel     = "service.kubernetes.io/headless"
 
 	// All IPSET names need to be less than 31 characters in order for the Kernel to accept them. Keep in mind that the
 	// actual formulation for this may be inet6:<setNameBase> depending on ip family, plus when we change ipsets we use
@@ -93,10 +101,16 @@ const (
 
 	tcpProtocol         = "tcp"
 	udpProtocol         = "udp"
+	sctpProtocol        = "sctp"
 	noneProtocol        = "none"
 	tunnelInterfaceType = "tunnel"
 
 	gracefulTermServiceTickTime = 5 * time.Second
+
+	tcpHeaderMinLen = 20
+
+	minPortNumber = 1
+	maxPortNumber = 65535
 )
 
 // NetworkServicesController enables local node as network service proxy through IPVS/LVS.
@@ -108,21 +122,21 @@ const (
 
 // NetworkServicesController struct stores information needed by the controller
 type NetworkServicesController struct {
-	primaryIP           net.IP
-	nodeHostName        string
+	krNode              utils.NodeAware
 	syncPeriod          time.Duration
 	mu                  sync.Mutex
-	serviceMap          serviceInfoMap
+	serviceMap          atomic.Pointer[serviceInfoMap]
+	metricsServiceMap   atomic.Pointer[metricsServiceMap]
 	endpointsMap        endpointSliceInfoMap
 	podCidr             string
 	excludedCidrs       []net.IPNet
+	ipFilter            svcip.Filter
 	masqueradeAll       bool
 	globalHairpin       bool
 	ipvsPermitAll       bool
 	client              kubernetes.Interface
 	nodeportBindOnAllIP bool
 	MetricsEnabled      bool
-	metricsMap          map[string][]string
 	ln                  LinuxNetworking
 	readyForUpdates     bool
 	ProxyFirewallSetup  *sync.Cond
@@ -141,21 +155,25 @@ type NetworkServicesController struct {
 	gracefulTermination bool
 	syncChan            chan int
 	dsr                 *dsrOpt
-	dsrTCPMSS           int
+	mtu                 int
 
 	iptablesCmdHandlers map[v1.IPFamily]utils.IPTablesHandler
 	ipSetHandlers       map[v1.IPFamily]utils.IPSetHandler
-	nodeIPv4Addrs       map[v1.NodeAddressType][]net.IP
-	nodeIPv6Addrs       map[v1.NodeAddressType][]net.IP
 	podIPv4CIDRs        []string
 	podIPv6CIDRs        []string
-	isIPv4Capable       bool
-	isIPv6Capable       bool
 
 	hpc                *hairpinController
-	hpEndpointReceiver chan string
+	hpEndpointReceiver chan hairpinEndpoint
 
 	nphc *nodePortHealthCheckController
+}
+
+// Informers is the set of shared informers the NSC reads from. We declare it here rather than accepting a
+// full informer factory so that the controller can only reach the resources it actually watches.
+type Informers interface {
+	Services() cache.SharedIndexInformer
+	EndpointSlices() cache.SharedIndexInformer
+	Pods() cache.SharedIndexInformer
 }
 
 type ipvsCalls interface {
@@ -230,6 +248,15 @@ type endpointSliceInfo struct {
 // map of all endpoints, with unique service id(namespace name, service name, port) as key
 type endpointSliceInfoMap map[string][]endpointSliceInfo
 
+func checkRPFilter1(ifname string) bool {
+	rpFilterValue, err := utils.GetSysctlSingleTemplate(utils.IPv4ConfRPFilterTemplate, ifname)
+	if err != nil {
+		klog.Errorf("failed to get rp_filter value for %s: %s", ifname, err.Error())
+		return false
+	}
+	return strings.TrimSpace(rpFilterValue) == "1"
+}
+
 // Run periodically sync ipvs configuration to reflect desired state of services and endpoints
 func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.ControllerHeartbeat,
 	stopCh <-chan struct{}, wg *sync.WaitGroup) {
@@ -291,16 +318,22 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 	// https://github.com/kubernetes/kubernetes/pull/70530/files
 	setSysCtlAndCheckError(utils.IPv4ConfAllArpAnnounce, arpAnnounceUseBestLocalAddress)
 
-	// Ensure rp_filter=2 for DSR capability, see:
+	// Ensure rp_filter=2 (or leave 0 untouched) for DSR capability, see:
 	// * https://access.redhat.com/solutions/53031
 	// * https://github.com/cloudnativelabs/kube-router/pull/1651#issuecomment-2072851683
-	if nsc.isIPv4Capable {
-		sysctlErr := utils.SetSysctlSingleTemplate(utils.IPv4ConfRPFilterTemplate, "all", 2)
-		if sysctlErr != nil {
-			if sysctlErr.IsFatal() {
-				klog.Fatal(sysctlErr.Error())
-			} else {
-				klog.Error(sysctlErr.Error())
+	// Only override rp_filter if it is set to 1, as enabling it from 0 to 2 can cause issues
+	// with some network configurations which use reverse routing
+	if nsc.krNode.IsIPv4Capable() {
+		for _, ifname := range []string{"all", "kube-bridge", "kube-dummy-if", nsc.krNode.GetNodeInterfaceName()} {
+			if checkRPFilter1(ifname) {
+				sysctlErr := utils.SetSysctlSingleTemplate(utils.IPv4ConfRPFilterTemplate, ifname, 2)
+				if sysctlErr != nil {
+					if sysctlErr.IsFatal() {
+						klog.Fatal(sysctlErr.Error())
+					} else {
+						klog.Error(sysctlErr.Error())
+					}
+				}
 			}
 		}
 	}
@@ -308,7 +341,7 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 	// https://github.com/cloudnativelabs/kube-router/issues/282
 	err = nsc.setupIpvsFirewall()
 	if err != nil {
-		klog.Fatalf("error setting up ipvs firewall: %s" + err.Error())
+		klog.Fatalf("error setting up ipvs firewall: %v", err.Error())
 	}
 	nsc.ProxyFirewallSetup.Broadcast()
 
@@ -320,9 +353,10 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 		klog.Info("Shutting down network services controller")
 		return
 	default:
-		err := nsc.doSync()
-		if err != nil {
-			klog.Fatalf("failed to perform initial full sync %s", err.Error())
+		// We come up degraded rather than fatal, because a restart can't fix a rejected service
+		syncErr := metrics.RunObservedSync(healthChan, healthcheck.NetworkServicesController, nsc.doSync)
+		if syncErr != nil {
+			klog.Errorf("initial full sync did not complete cleanly, continuing anyway: %v", syncErr)
 		}
 		nsc.readyForUpdates = true
 	}
@@ -345,46 +379,48 @@ func (nsc *NetworkServicesController) Run(healthChan chan<- *healthcheck.Control
 			}
 
 		case perform := <-nsc.syncChan:
-			healthcheck.SendHeartBeat(healthChan, "NSC")
-			switch perform {
-			case synctypeAll:
-				klog.V(1).Info("Performing requested full sync of services")
-				err = nsc.doSync()
-				if err != nil {
-					klog.Errorf("Error during full sync in network service controller. Error: " + err.Error())
-				}
-			case synctypeIpvs:
-				// We call the component pieces of doSync() here because for methods that send this on the channel they
-				// have already done expensive pieces of the doSync() method like building service and endpoint info
-				// and we don't want to duplicate the effort, so this is a slimmer version of doSync()
-				klog.V(1).Info("Performing requested sync of ipvs services")
-				nsc.mu.Lock()
-				err = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
-				if err != nil {
-					klog.Errorf("Error during ipvs sync in network service controller. Error: " + err.Error())
-				}
-				err = nsc.syncHairpinIptablesRules()
-				if err != nil {
-					klog.Errorf("Error syncing hairpin iptables rules: %s", err.Error())
-				}
-				nsc.mu.Unlock()
-			}
-			if err == nil {
-				healthcheck.SendHeartBeat(healthChan, "NSC")
-			}
+			// requestedSync logs its own failures per sync flavor, so there's nothing to log here
+			_ = metrics.RunObservedSync(healthChan, healthcheck.NetworkServicesController, func() error {
+				return nsc.requestedSync(perform)
+			})
 
 		case <-t.C:
 			klog.V(1).Info("Performing periodic sync of ipvs services")
-			healthcheck.SendHeartBeat(healthChan, "NSC")
-			err := nsc.doSync()
+			err := metrics.RunObservedSync(healthChan, healthcheck.NetworkServicesController, nsc.doSync)
 			if err != nil {
-				klog.Errorf("Error during periodic ipvs sync in network service controller. Error: " + err.Error())
-				klog.Errorf("Skipping sending heartbeat from network service controller as periodic sync failed.")
-			} else {
-				healthcheck.SendHeartBeat(healthChan, "NSC")
+				klog.Errorf("error during periodic ipvs sync in network service controller. Error: %v", err)
 			}
 		}
 	}
+}
+
+// requestedSync runs the sync flavor asked for on syncChan and returns the joined outcome
+func (nsc *NetworkServicesController) requestedSync(perform int) error {
+	var syncErr error
+	switch perform {
+	case synctypeAll:
+		klog.V(1).Info("Performing requested full sync of services")
+		syncErr = nsc.doSync()
+		if syncErr != nil {
+			klog.Errorf("error during full sync in network service controller. Error: %v", syncErr)
+		}
+	case synctypeIpvs:
+		// We call the component pieces of doSync() here because for methods that send this on the channel they
+		// have already done expensive pieces of the doSync() method like building service and endpoint info
+		// and we don't want to duplicate the effort, so this is a slimmer version of doSync()
+		klog.V(1).Info("Performing requested sync of ipvs services")
+		nsc.mu.Lock()
+		defer nsc.mu.Unlock()
+		if ipvsErr := nsc.syncIpvsServices(nsc.getServiceMap(), nsc.endpointsMap); ipvsErr != nil {
+			klog.Errorf("error during ipvs sync in network service controller. Error: %v", ipvsErr)
+			syncErr = errors.Join(syncErr, ipvsErr)
+		}
+		if hairpinErr := nsc.syncHairpinIptablesRules(); hairpinErr != nil {
+			klog.Errorf("error syncing hairpin iptables rules: %v", hairpinErr)
+			syncErr = errors.Join(syncErr, hairpinErr)
+		}
+	}
+	return syncErr
 }
 
 func (nsc *NetworkServicesController) sync(syncType int) {
@@ -396,37 +432,30 @@ func (nsc *NetworkServicesController) sync(syncType int) {
 }
 
 func (nsc *NetworkServicesController) doSync() error {
-	var err error
+	// Joined rather than overwritten so the returned error covers the whole iteration
+	var syncErr error
 	nsc.mu.Lock()
 	defer nsc.mu.Unlock()
 
 	// enable masquerade rule
-	err = nsc.ensureMasqueradeIptablesRule()
-	if err != nil {
+	if err := nsc.ensureMasqueradeIptablesRule(); err != nil {
 		klog.Errorf("Failed to do add masquerade rule in POSTROUTING chain of nat table due to: %s", err.Error())
+		syncErr = errors.Join(syncErr, fmt.Errorf("masquerade rule: %w", err))
 	}
 
-	nsc.serviceMap = nsc.buildServicesInfo()
+	nsc.setServiceMap(nsc.buildServicesInfo())
 	nsc.endpointsMap = nsc.buildEndpointSliceInfo()
-	err = nsc.syncHairpinIptablesRules()
-	if err != nil {
+	if err := nsc.syncHairpinIptablesRules(); err != nil {
 		klog.Errorf("Error syncing hairpin iptables rules: %s", err.Error())
+		syncErr = errors.Join(syncErr, fmt.Errorf("hairpin iptables rules: %w", err))
 	}
 
-	err = nsc.syncIpvsServices(nsc.serviceMap, nsc.endpointsMap)
-	if err != nil {
+	if err := nsc.syncIpvsServices(nsc.getServiceMap(), nsc.endpointsMap); err != nil {
 		klog.Errorf("Error syncing IPVS services: %s", err.Error())
-		return err
+		syncErr = errors.Join(syncErr, fmt.Errorf("ipvs services: %w", err))
 	}
 
-	if nsc.MetricsEnabled {
-		err = nsc.publishMetrics(nsc.serviceMap)
-		if err != nil {
-			klog.Errorf("Error publishing metrics: %v", err)
-			return err
-		}
-	}
-	return nil
+	return syncErr
 }
 
 func (nsc *NetworkServicesController) setupIpvsFirewall() error {
@@ -442,18 +471,18 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 		// Create ipset for local addresses.
 		_, err = ipSetHandler.Create(localIPsIPSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
 		if err != nil {
-			return fmt.Errorf("failed to create ipset: %s - %v", localIPsIPSetName, err)
+			return fmt.Errorf("failed to create ipset: %s - %w", localIPsIPSetName, err)
 		}
 
 		// Create 2 ipsets for services. One for 'ip' and one for 'ip,port'
 		_, err = ipSetHandler.Create(serviceIPsIPSetName, utils.TypeHashIP, utils.OptionTimeout, "0")
 		if err != nil {
-			return fmt.Errorf("failed to create ipset: %s - %v", serviceIPsIPSetName, err)
+			return fmt.Errorf("failed to create ipset: %s - %w", serviceIPsIPSetName, err)
 		}
 
 		_, err = ipSetHandler.Create(serviceIPPortsSetName, utils.TypeHashIPPort, utils.OptionTimeout, "0")
 		if err != nil {
-			return fmt.Errorf("failed to create ipset: %s - %v", serviceIPPortsSetName, err)
+			return fmt.Errorf("failed to create ipset: %s - %w", serviceIPPortsSetName, err)
 		}
 	}
 
@@ -462,58 +491,35 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 		// ClearChain either clears an existing chain or creates a new one.
 		err = iptablesCmdHandler.ClearChain("filter", ipvsFirewallChainName)
 		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			return fmt.Errorf("failed to run iptables command: %w", err)
 		}
 
-		// config.IpvsPermitAll: true then create INPUT/KUBE-ROUTER-SERVICE Chain creation else return
+		// config.IpvsPermitAll: true then create INPUT/KUBE-ROUTER-SERVICE Chain creation else skip
 		if !nsc.ipvsPermitAll {
-			return nil
+			continue
 		}
 
 		var comment string
 		var args []string
 		var exists bool
-		var icmpProto string
-		var icmpType string
 		var icmpRejectType string
-
 		//nolint:exhaustive // we don't need exhaustive searching for IP Families
 		switch family {
 		case v1.IPv4Protocol:
-			icmpProto = "icmp"
-			icmpType = "--icmp-type"
 			icmpRejectType = "icmp-port-unreachable"
 		case v1.IPv6Protocol:
-			icmpProto = "ipv6-icmp"
-			icmpType = "--icmpv6-type"
 			icmpRejectType = "icmp6-port-unreachable"
 		}
 
-		// Allow various types of ICMP that are important for routing
-		comment = "allow icmp echo requests to service IPs"
-		args = []string{"-m", "comment", "--comment", comment, "-p", icmpProto, icmpType, "echo-request",
-			"-j", "ACCEPT"}
-		err = iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, args...)
-		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
-		}
-
-		comment = "allow icmp ttl exceeded messages to service IPs"
-		args = []string{"-m", "comment", "--comment", comment, "-p", icmpProto, icmpType, "time-exceeded",
-			"-j", "ACCEPT"}
-		err = iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, args...)
-		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
-		}
-
-		// destination-unreachable here is also responsible for handling / allowing
-		// PMTU (https://en.wikipedia.org/wiki/Path_MTU_Discovery) responses
-		comment = "allow icmp destination unreachable messages to service IPs"
-		args = []string{"-m", "comment", "--comment", comment, "-p", icmpProto, icmpType, "destination-unreachable",
-			"-j", "ACCEPT"}
-		err = iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, args...)
-		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+		// Add common IPv4/IPv6 ICMP rules to the default network policy chain to ensure that pods communicate properly
+		icmpRules := utils.CommonICMPRules(family)
+		for _, icmpRule := range icmpRules {
+			icmpArgs := []string{"-m", "comment", "--comment", icmpRule.Comment, "-p", icmpRule.IPTablesProto,
+				icmpRule.IPTablesType, icmpRule.ICMPType, "-j", "ACCEPT"}
+			err = iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, icmpArgs...)
+			if err != nil {
+				return fmt.Errorf("failed to run iptables command: %w", err)
+			}
 		}
 
 		// Get into specific service specific allowances
@@ -522,7 +528,7 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 			"--match-set", getIPSetName(serviceIPPortsSetName, family), "dst,dst", "-j", "ACCEPT"}
 		err := iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, args...)
 		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			return fmt.Errorf("failed to run iptables command: %w", err)
 		}
 
 		// We exclude the local addresses here as that would otherwise block all traffic to local addresses if any
@@ -533,19 +539,19 @@ func (nsc *NetworkServicesController) setupIpvsFirewall() error {
 			"-j", "REJECT", "--reject-with", icmpRejectType}
 		err = iptablesCmdHandler.AppendUnique("filter", ipvsFirewallChainName, args...)
 		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			return fmt.Errorf("failed to run iptables command: %w", err)
 		}
 
 		// Pass incoming traffic into our custom chain.
 		ipvsFirewallInputChainRule := getIPVSFirewallInputChainRule(family)
 		exists, err = iptablesCmdHandler.Exists("filter", "INPUT", ipvsFirewallInputChainRule...)
 		if err != nil {
-			return fmt.Errorf("failed to run iptables command: %s", err.Error())
+			return fmt.Errorf("failed to run iptables command: %w", err)
 		}
 		if !exists {
 			err = iptablesCmdHandler.Insert("filter", "INPUT", 1, ipvsFirewallInputChainRule...)
 			if err != nil {
-				return fmt.Errorf("failed to run iptables command: %s", err.Error())
+				return fmt.Errorf("failed to run iptables command: %w", err)
 			}
 		}
 	}
@@ -592,7 +598,7 @@ func (nsc *NetworkServicesController) cleanupIpvsFirewall() {
 	// There are certain actions like Cleanup() actions that aren't working with full instantiations of the controller
 	// and in these instances the mutex may not be present and may not need to be present as they are operating out of a
 	// single goroutine where there is no need for locking
-	if nil != nsc.ipsetMutex {
+	if nsc.ipsetMutex != nil {
 		klog.V(1).Infof("Attempting to attain ipset mutex lock")
 		nsc.ipsetMutex.Lock()
 		klog.V(1).Infof("Attained ipset mutex lock, continuing...")
@@ -609,7 +615,6 @@ func (nsc *NetworkServicesController) cleanupIpvsFirewall() {
 		}
 
 		for _, ipSetName := range []string{localIPsIPSetName, serviceIPsIPSetName, serviceIPPortsSetName} {
-			ipSetName := ipSetName
 			if _, ok := ipSetHandler.Sets()[ipSetName]; ok {
 				err = ipSetHandler.Destroy(ipSetName)
 				if err != nil {
@@ -636,15 +641,15 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 	// Populate local addresses ipset.
 	addrsMap, err := getAllLocalIPs()
 	if err != nil {
-		return fmt.Errorf("failed to get local IPs: %s", err)
+		return fmt.Errorf("failed to get local IPs: %w", err)
 	}
 
 	for family, addrs := range addrsMap {
 		// Don't run for families that we don't support
-		if family == v1.IPv4Protocol && !nsc.isIPv4Capable {
+		if family == v1.IPv4Protocol && !nsc.krNode.IsIPv4Capable() {
 			continue
 		}
-		if family == v1.IPv6Protocol && !nsc.isIPv6Capable {
+		if family == v1.IPv6Protocol && !nsc.krNode.IsIPv6Capable() {
 			continue
 		}
 
@@ -661,7 +666,7 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 	// Populate service ipsets.
 	ipvsServices, err := nsc.ln.ipvsGetServices()
 	if err != nil {
-		return errors.New("Failed to list IPVS services: " + err.Error())
+		return fmt.Errorf("failed to list IPVS services: %w", err)
 	}
 
 	serviceIPsSets := make(map[v1.IPFamily][][]string)
@@ -673,13 +678,25 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 		var port int
 		if ipvsService.Address != nil {
 			address = ipvsService.Address
+			port = int(ipvsService.Port)
+
+			isValid, err := nsc.isValidKubeRouterServiceArtifact(address, port, addrsMap)
+			if err != nil {
+				klog.Infof("failed to lookup service by address %s: %v - this does not appear to be a kube-router "+
+					"controlled service, skipping...", address, err)
+				continue
+			}
+			if !isValid {
+				klog.Infof("address %s is not a valid kube-router controlled service, skipping...", address)
+				continue
+			}
+
 			protocol = convertSysCallProtoToSvcProto(ipvsService.Protocol)
 			if protocol == noneProtocol {
 				klog.Warningf("failed to convert protocol %d to a valid IPVS protocol for service: %s skipping",
 					ipvsService.Protocol, ipvsService.Address.String())
 				continue
 			}
-			port = int(ipvsService.Port)
 		} else if ipvsService.FWMark != 0 {
 			var ipString string
 			ipString, protocol, port, err = nsc.lookupServiceByFWMark(ipvsService.FWMark)
@@ -703,7 +720,11 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 
 		serviceIPsSets[family] = append(serviceIPsSets[family], []string{address.String(), utils.OptionTimeout, "0"})
 
-		ipvsAddressWithPort := fmt.Sprintf("%s,%s:%d", address, protocol, port)
+		ipsetProto := protocol
+		if protocol == sctpProtocol {
+			ipsetProto = strconv.FormatUint(uint64(convertSvcProtoToSysCallProto(protocol)), 10)
+		}
+		ipvsAddressWithPort := fmt.Sprintf("%s,%s:%d", address, ipsetProto, port)
 		serviceIPPortsIPSets[family] = append(serviceIPPortsIPSets[family],
 			[]string{ipvsAddressWithPort, utils.OptionTimeout, "0"})
 
@@ -714,94 +735,20 @@ func (nsc *NetworkServicesController) syncIpvsFirewall() error {
 
 		setHandler.RefreshSet(serviceIPPortsSetName, serviceIPPortsIPSets[family], utils.TypeHashIPPort)
 
-		err := setHandler.Restore()
+		multiFamilySetNames := utils.GenerateMultiFamilySetNames(
+			[]string{localIPsIPSetName, serviceIPsIPSetName, serviceIPPortsSetName},
+		)
+		err := setHandler.RestoreSets(multiFamilySetNames)
 		if err != nil {
-			return fmt.Errorf("could not save ipset for service firewall: %v", err)
+			return fmt.Errorf("could not save ipset for service firewall: %w", err)
 		}
 	}
 
-	return nil
-}
-
-func (nsc *NetworkServicesController) publishMetrics(serviceInfoMap serviceInfoMap) error {
-	start := time.Now()
-	defer func() {
-		endTime := time.Since(start)
-		klog.V(2).Infof("Publishing IPVS metrics took %v", endTime)
-		if nsc.MetricsEnabled {
-			metrics.ControllerIpvsMetricsExportTime.Observe(endTime.Seconds())
-		}
-	}()
-
-	ipvsSvcs, err := nsc.ln.ipvsGetServices()
-	if err != nil {
-		return errors.New("Failed to list IPVS services: " + err.Error())
-	}
-
-	klog.V(1).Info("Publishing IPVS metrics")
-	for _, svc := range serviceInfoMap {
-		var protocol uint16
-		var pushMetric bool
-		var svcVip string
-
-		protocol = convertSvcProtoToSysCallProto(svc.protocol)
-		for _, ipvsSvc := range ipvsSvcs {
-
-			switch svcAddress := ipvsSvc.Address.String(); svcAddress {
-			case svc.clusterIP.String():
-				if protocol == ipvsSvc.Protocol && uint16(svc.port) == ipvsSvc.Port {
-					pushMetric = true
-					svcVip = svc.clusterIP.String()
-				} else {
-					pushMetric = false
-				}
-			case nsc.primaryIP.String():
-				if protocol == ipvsSvc.Protocol && uint16(svc.port) == ipvsSvc.Port {
-					pushMetric = true
-					svcVip = nsc.primaryIP.String()
-				} else {
-					pushMetric = false
-				}
-			default:
-				svcVip = ""
-				pushMetric = false
-			}
-
-			if pushMetric {
-
-				klog.V(3).Infof("Publishing metrics for %s/%s (%s:%d/%s)",
-					svc.namespace, svc.name, svcVip, svc.port, svc.protocol)
-
-				labelValues := []string{
-					svc.namespace,
-					svc.name,
-					svcVip,
-					svc.protocol,
-					strconv.Itoa(svc.port),
-				}
-
-				key := generateIPPortID(svcVip, svc.protocol, strconv.Itoa(svc.port))
-				nsc.metricsMap[key] = labelValues
-				// these same metrics should be deleted when the service is deleted.
-				metrics.ServiceBpsIn.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.BPSIn))
-				metrics.ServiceBpsOut.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.BPSOut))
-				metrics.ServiceBytesIn.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.BytesIn))
-				metrics.ServiceBytesOut.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.BytesOut))
-				metrics.ServiceCPS.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.CPS))
-				metrics.ServicePacketsIn.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.PacketsIn))
-				metrics.ServicePacketsOut.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.PacketsOut))
-				metrics.ServicePpsIn.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.PPSIn))
-				metrics.ServicePpsOut.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.PPSOut))
-				metrics.ServiceTotalConn.WithLabelValues(labelValues...).Set(float64(ipvsSvc.Stats.Connections))
-				metrics.ControllerIpvsServices.Set(float64(len(ipvsSvcs)))
-			}
-		}
-	}
 	return nil
 }
 
 // OnEndpointsUpdate handle change in endpoints update from the API server
-func (nsc *NetworkServicesController) OnEndpointsUpdate(es *discovery.EndpointSlice) {
+func (nsc *NetworkServicesController) OnEndpointsUpdate(es *discoveryv1.EndpointSlice) {
 
 	nsc.mu.Lock()
 	defer nsc.mu.Unlock()
@@ -839,7 +786,7 @@ func (nsc *NetworkServicesController) OnEndpointsUpdate(es *discovery.EndpointSl
 
 	if !endpointsMapsEquivalent(newEndpointsMap, nsc.endpointsMap) {
 		nsc.endpointsMap = newEndpointsMap
-		nsc.serviceMap = newServiceMap
+		nsc.setServiceMap(newServiceMap)
 		klog.V(1).Infof("Syncing IPVS services sync for update to endpoint: %s/%s", es.Namespace, es.Name)
 		nsc.sync(synctypeIpvs)
 	} else {
@@ -875,9 +822,10 @@ func (nsc *NetworkServicesController) OnServiceUpdate(svc *v1.Service) {
 	newServiceMap := nsc.buildServicesInfo()
 	newEndpointsMap := nsc.buildEndpointSliceInfo()
 
-	if len(newServiceMap) != len(nsc.serviceMap) || !reflect.DeepEqual(newServiceMap, nsc.serviceMap) {
+	oldServiceMap := nsc.getServiceMap()
+	if len(newServiceMap) != len(oldServiceMap) || !reflect.DeepEqual(newServiceMap, oldServiceMap) {
 		nsc.endpointsMap = newEndpointsMap
-		nsc.serviceMap = newServiceMap
+		nsc.setServiceMap(newServiceMap)
 		klog.V(1).Infof("Syncing IPVS services sync on update to service: %s/%s", svc.Namespace, svc.Name)
 		nsc.sync(synctypeIpvs)
 	} else {
@@ -921,7 +869,7 @@ func (nsc *NetworkServicesController) buildServicesInfo() serviceInfoMap {
 
 		// We handle headless service labels differently from a "None" or blank ClusterIP because ClusterIP is
 		// guaranteed to be immuteable whereas labels can be added / removed
-		_, err = getLabelFromMap(svcHeadlessLabel, svc.Labels)
+		_, err = getLabelFromMap(headlessLabel, svc.Labels)
 		if err == nil {
 			klog.V(2).Infof("Skipping service name:%s namespace:%s due to headless label being set", svc.Name,
 				svc.Namespace)
@@ -938,46 +886,54 @@ func (nsc *NetworkServicesController) buildServicesInfo() serviceInfoMap {
 				targetPort:          port.TargetPort.String(),
 				protocol:            strings.ToLower(string(port.Protocol)),
 				nodePort:            int(port.NodePort),
-				name:                svc.ObjectMeta.Name,
-				namespace:           svc.ObjectMeta.Namespace,
+				name:                svc.Name,
+				namespace:           svc.Namespace,
 				externalIPs:         make([]string, len(svc.Spec.ExternalIPs)),
 				intTrafficPolicy:    &intClusterPolicyDefault,
 				extTrafficPolicy:    &extClusterPolicyDefault,
 				healthCheckNodePort: int(svc.Spec.HealthCheckNodePort),
 			}
-			dsrMethod, ok := svc.ObjectMeta.Annotations[svcDSRAnnotation]
+			dsrMethod, ok := svc.Annotations[svcDSRAnnotation]
 			if ok {
 				svcInfo.directServerReturn = true
 				svcInfo.directServerReturnMethod = dsrMethod
 			}
 			svcInfo.scheduler = ipvs.RoundRobin
-			schedulingMethod, ok := svc.ObjectMeta.Annotations[svcSchedulerAnnotation]
+			schedulingMethod, ok := svc.Annotations[svcSchedulerAnnotation]
 			if ok {
-				switch {
-				case schedulingMethod == ipvs.RoundRobin:
+				switch schedulingMethod {
+				case ipvs.RoundRobin:
 					svcInfo.scheduler = ipvs.RoundRobin
-				case schedulingMethod == ipvs.LeastConnection:
+				case ipvs.LeastConnection:
 					svcInfo.scheduler = ipvs.LeastConnection
-				case schedulingMethod == ipvs.DestinationHashing:
+				case ipvs.DestinationHashing:
 					svcInfo.scheduler = ipvs.DestinationHashing
-				case schedulingMethod == ipvs.SourceHashing:
+				case ipvs.SourceHashing:
 					svcInfo.scheduler = ipvs.SourceHashing
-				case schedulingMethod == IpvsMaglevHashing:
+				case IpvsMaglevHashing:
 					svcInfo.scheduler = IpvsMaglevHashing
 				}
 			}
 
-			flags, ok := svc.ObjectMeta.Annotations[svcSchedFlagsAnnotation]
+			flags, ok := svc.Annotations[svcSchedFlagsAnnotation]
 			if ok && svcInfo.scheduler == IpvsMaglevHashing {
 				svcInfo.flags = parseSchedFlags(flags)
 			}
 
 			copy(svcInfo.externalIPs, svc.Spec.ExternalIPs)
+			if nsc.ipFilter != nil {
+				svcInfo.externalIPs = nsc.ipFilter.FilterExternalIPs(svcInfo.externalIPs, svc.Name,
+					svc.Namespace)
+			}
 			copy(svcInfo.clusterIPs, svc.Spec.ClusterIPs)
 			for _, lbIngress := range svc.Status.LoadBalancer.Ingress {
-				if len(lbIngress.IP) > 0 {
+				if len(lbIngress.IP) > 0 && (lbIngress.IPMode == nil || *lbIngress.IPMode != v1.LoadBalancerIPModeProxy) {
 					svcInfo.loadBalancerIPs = append(svcInfo.loadBalancerIPs, lbIngress.IP)
 				}
+			}
+			if nsc.ipFilter != nil {
+				svcInfo.loadBalancerIPs = nsc.ipFilter.FilterLoadBalancerIPs(svcInfo.loadBalancerIPs,
+					svc.Name, svc.Namespace)
 			}
 			svcInfo.sessionAffinity = svc.Spec.SessionAffinity == v1.ServiceAffinityClientIP
 
@@ -987,17 +943,18 @@ func (nsc *NetworkServicesController) buildServicesInfo() serviceInfoMap {
 				// https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/v1/defaults.go#L106
 				svcInfo.sessionAffinityTimeoutSeconds = *svc.Spec.SessionAffinityConfig.ClientIP.TimeoutSeconds
 			}
-			_, svcInfo.hairpin = svc.ObjectMeta.Annotations[svcHairpinAnnotation]
-			_, svcInfo.hairpinExternalIPs = svc.ObjectMeta.Annotations[svcHairpinExternalIPsAnnotation]
-			_, svcInfo.skipLbIps = svc.ObjectMeta.Annotations[svcSkipLbIpsAnnotation]
+			_, svcInfo.hairpin = svc.Annotations[svcHairpinAnnotation]
+			_, svcInfo.hairpinExternalIPs = svc.Annotations[svcHairpinExternalIPsAnnotation]
+			_, svcInfo.skipLbIps = svc.Annotations[svcSkipLbIpsAnnotation]
 			svcInfo.intTrafficPolicy = svc.Spec.InternalTrafficPolicy
 			svcInfo.extTrafficPolicy = &svc.Spec.ExternalTrafficPolicy
 
 			// The kube-router.io/service.local annotation has the ability to override the internal and external traffic
-			// policy that is set in the spec. In this case we set both to local when the annotation is true so that
-			// previous functionality of the annotation is best preserved.
-			if svc.ObjectMeta.Annotations[svcLocalAnnotation] == "true" {
-				intTrafficPolicyLocal := v1.ServiceInternalTrafficPolicyLocal
+			// policy that is set in the spec. Previously, when this was active set both to local when the annotation is
+			// true so that previous functionality of the annotation is best preserved. However, this has proved to not
+			// be a good fit for ClusterIP traffic, so we retain cluster for internal traffic policy.
+			if svc.Annotations[svcLocalAnnotation] == "true" {
+				intTrafficPolicyLocal := v1.ServiceInternalTrafficPolicyCluster
 				extTrafficPolicyLocal := v1.ServiceExternalTrafficPolicyLocal
 				svcInfo.intTrafficPolicy = &intTrafficPolicyLocal
 				svcInfo.extTrafficPolicy = &extTrafficPolicyLocal
@@ -1017,8 +974,8 @@ func parseSchedFlags(value string) schedFlags {
 		return schedFlags{}
 	}
 
-	flags := strings.Split(value, ",")
-	for _, flag := range flags {
+	flags := strings.SplitSeq(value, ",")
+	for flag := range flags {
 		switch strings.Trim(flag, " ") {
 		case IpvsSvcFSched1:
 			flag1 = true
@@ -1034,15 +991,29 @@ func parseSchedFlags(value string) schedFlags {
 }
 
 func shuffle(endPoints []endpointSliceInfo) []endpointSliceInfo {
-	for index1 := range endPoints {
-		randBitInt, err := rand.Int(rand.Reader, big.NewInt(int64(index1+1)))
-		index2 := randBitInt.Int64()
-		if err != nil {
-			klog.Warningf("unable to get a random int: %v", err)
-		}
-		endPoints[index1], endPoints[index2] = endPoints[index2], endPoints[index1]
-	}
+	// Important: Do not introduce crypto/rand here as it introduces too much CPU usage on larger clusters
+	rand.Shuffle(len(endPoints), func(i, j int) {
+		endPoints[i], endPoints[j] = endPoints[j], endPoints[i]
+	})
 	return endPoints
+}
+
+// orderEndpointsForScheduler returns a copy of endpoints in the order they should be added to IPVS
+func orderEndpointsForScheduler(endpoints []endpointSliceInfo, scheduler string) []endpointSliceInfo {
+	ordered := slices.Clone(endpoints)
+	switch scheduler {
+	case ipvs.SourceHashing, ipvs.DestinationHashing, IpvsMaglevHashing:
+		// Hashing schedulers map clients based on destination order, so every node should have the same order, even
+		// maglev showed some small deviation when order was mixed (likely because of slot contention)
+		slices.SortFunc(ordered, func(a, b endpointSliceInfo) int {
+			return cmp.Or(strings.Compare(a.ip, b.ip), cmp.Compare(a.port, b.port))
+		})
+	default:
+		// For all other algorithms we shuffle here to improve the distribution of algorithms like rr and lc, see issue
+		// #99 for more info
+		shuffle(ordered)
+	}
+	return ordered
 }
 
 // buildEndpointSliceInfo creates a map of EndpointSlices taken at a moment in time
@@ -1050,14 +1021,21 @@ func (nsc *NetworkServicesController) buildEndpointSliceInfo() endpointSliceInfo
 	endpointsMap := make(endpointSliceInfoMap)
 	for _, obj := range nsc.epSliceLister.List() {
 		var isIPv4, isIPv6 bool
-		es := obj.(*discovery.EndpointSlice)
+		es := obj.(*discoveryv1.EndpointSlice)
 		klog.V(2).Infof("Building endpoint info for EndpointSlice: %s/%s", es.Namespace, es.Name)
+
+		if _, hasHeadless := es.Labels[headlessLabel]; hasHeadless {
+			klog.V(2).Infof("Skipping EndpointSlice %s/%s due to headless label being set",
+				es.Namespace, es.Name)
+			continue
+		}
+
 		switch es.AddressType {
-		case discovery.AddressTypeIPv4:
+		case discoveryv1.AddressTypeIPv4:
 			isIPv4 = true
-		case discovery.AddressTypeIPv6:
+		case discoveryv1.AddressTypeIPv6:
 			isIPv6 = true
-		case discovery.AddressTypeFQDN:
+		case discoveryv1.AddressTypeFQDN:
 			// At this point we don't handle FQDN type EndpointSlices, at some point in the future this might change
 			continue
 		default:
@@ -1108,7 +1086,21 @@ func (nsc *NetworkServicesController) buildEndpointSliceInfo() endpointSliceInfo
 				var endpoints []endpointSliceInfo
 				var ok bool
 
-				svcID := generateServiceID(es.Namespace, svcName, *port.Name)
+				// a nil port name is treated as an unnamed port, the same as the API server's defaulting
+				portName := ""
+				if port.Name != nil {
+					portName = *port.Name
+				}
+
+				// EndpointSlice ports may have a nil or out of range port number (e.g. slices used for other
+				// purposes), we can't build an IPVS destination without a valid one
+				if port.Port == nil || *port.Port < minPortNumber || *port.Port > maxPortNumber {
+					klog.V(2).Infof("EndpointSlice %s/%s has a port %s without a valid port number, skipping...",
+						es.Namespace, es.Name, portName)
+					continue
+				}
+
+				svcID := generateServiceID(es.Namespace, svcName, portName)
 
 				// we may have already started to populate endpoints for this service from another EndpointSlice, if so
 				// continue where we left off, otherwise create a new slice
@@ -1117,7 +1109,7 @@ func (nsc *NetworkServicesController) buildEndpointSliceInfo() endpointSliceInfo
 				}
 
 				for _, addr := range ep.Addresses {
-					isLocal := ep.NodeName != nil && *ep.NodeName == nsc.nodeHostName
+					isLocal := ep.NodeName != nil && *ep.NodeName == nsc.krNode.GetNodeName()
 					endpoints = append(endpoints, endpointSliceInfo{
 						ip:            addr,
 						port:          int(*port.Port),
@@ -1129,7 +1121,7 @@ func (nsc *NetworkServicesController) buildEndpointSliceInfo() endpointSliceInfo
 						isTerminating: ep.Conditions.Terminating != nil && *ep.Conditions.Terminating,
 					})
 				}
-				endpointsMap[svcID] = shuffle(endpoints)
+				endpointsMap[svcID] = endpoints
 			}
 		}
 	}
@@ -1158,12 +1150,12 @@ func (nsc *NetworkServicesController) ensureMasqueradeIptablesRule() error {
 		if nsc.masqueradeAll {
 			err := iptablesCmdHandler.AppendUnique("nat", "POSTROUTING", args...)
 			if err != nil {
-				return fmt.Errorf("failed to create iptables rule to masquerade all outbound IPVS traffic: %v", err)
+				return fmt.Errorf("failed to create iptables rule to masquerade all outbound IPVS traffic: %w", err)
 			}
 		} else {
 			exists, err := iptablesCmdHandler.Exists("nat", "POSTROUTING", args...)
 			if err != nil {
-				return fmt.Errorf("failed to lookup iptables rule to masquerade all outbound IPVS traffic: %v", err)
+				return fmt.Errorf("failed to lookup iptables rule to masquerade all outbound IPVS traffic: %w", err)
 			}
 			if exists {
 				err = iptablesCmdHandler.Delete("nat", "POSTROUTING", args...)
@@ -1186,7 +1178,7 @@ func (nsc *NetworkServicesController) ensureMasqueradeIptablesRule() error {
 
 			err := iptablesCmdHandler.AppendUnique("nat", "POSTROUTING", args...)
 			if err != nil {
-				return fmt.Errorf("failed to run iptables command: %v", err)
+				return fmt.Errorf("failed to run iptables command: %w", err)
 			}
 		}
 	}
@@ -1231,7 +1223,7 @@ func (nsc *NetworkServicesController) deleteBadMasqueradeIptablesRules() error {
 		for _, args := range argsBad {
 			exists, err := iptablesCmdHandler.Exists("nat", "POSTROUTING", args...)
 			if err != nil {
-				return fmt.Errorf("failed to lookup iptables rule: %v", err)
+				return fmt.Errorf("failed to lookup iptables rule: %w", err)
 			}
 
 			if exists {
@@ -1263,7 +1255,7 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 	ipv6RulesNeeded := make(map[string][]string)
 
 	// Generate the rules that we need
-	for svcName, svcInfo := range nsc.serviceMap {
+	for svcName, svcInfo := range nsc.getServiceMap() {
 		if nsc.globalHairpin || svcInfo.hairpin {
 			// If this service doesn't have any active & local endpoints on this node, then skip it as only local
 			// endpoints matter for hairpinning
@@ -1298,17 +1290,13 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 					family = v1.IPv4Protocol
 					familyClusterIPs = clusterIPs[v1.IPv4Protocol]
 					familyExternalIPs = externalIPs[v1.IPv4Protocol]
-					//nolint:gocritic // we intend to append to separate maps here
-					familyNodeIPs = append(nsc.nodeIPv4Addrs[v1.NodeInternalIP],
-						nsc.nodeIPv4Addrs[v1.NodeExternalIP]...)
+					familyNodeIPs = nsc.krNode.GetNodeIPv4Addrs()
 					rulesMap = ipv4RulesNeeded
 				} else {
 					family = v1.IPv6Protocol
 					familyClusterIPs = clusterIPs[v1.IPv6Protocol]
 					familyExternalIPs = externalIPs[v1.IPv6Protocol]
-					//nolint:gocritic // we intend to append to separate maps here
-					familyNodeIPs = append(nsc.nodeIPv6Addrs[v1.NodeInternalIP],
-						nsc.nodeIPv6Addrs[v1.NodeExternalIP]...)
+					familyNodeIPs = nsc.krNode.GetNodeIPv6Addrs()
 					rulesMap = ipv6RulesNeeded
 				}
 				if len(familyClusterIPs) < 1 {
@@ -1327,7 +1315,7 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 				// Without this change, the return traffic from a client to a service within the same pod will never
 				// make it back into the pod's namespace
 				if nsc.hpc != nil {
-					nsc.hpEndpointReceiver <- ep.ip
+					nsc.hpEndpointReceiver <- hairpinEndpoint{namespace: svcInfo.namespace, ip: ep.ip}
 				}
 
 				// Handle ClusterIP Service
@@ -1347,18 +1335,18 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 	}
 
 	// Cleanup (if needed) and return if there's no hairpin-mode Services
-	if len(ipv4RulesNeeded) == 0 && nsc.isIPv4Capable {
+	if len(ipv4RulesNeeded) == 0 && nsc.krNode.IsIPv4Capable() {
 		klog.V(1).Info("No IPv4 hairpin-mode enabled services found -- no hairpin rules created")
 		err := nsc.deleteHairpinIptablesRules(v1.IPv4Protocol)
 		if err != nil {
-			return fmt.Errorf("error deleting hairpin rules: %v", err)
+			return fmt.Errorf("error deleting hairpin rules: %w", err)
 		}
 	}
-	if len(ipv6RulesNeeded) == 0 && nsc.isIPv6Capable {
+	if len(ipv6RulesNeeded) == 0 && nsc.krNode.IsIPv6Capable() {
 		klog.V(1).Info("No IPv6 hairpin-mode enabled services found -- no hairpin rules created")
 		err := nsc.deleteHairpinIptablesRules(v1.IPv6Protocol)
 		if err != nil {
-			return fmt.Errorf("error deleting hairpin rules: %v", err)
+			return fmt.Errorf("error deleting hairpin rules: %w", err)
 		}
 	}
 	// If both rulesets are blank, then return now as our work is done
@@ -1384,22 +1372,16 @@ func (nsc *NetworkServicesController) syncHairpinIptablesRules() error {
 
 		rulesFromNode, err := iptablesCmdHandler.List("nat", ipvsHairpinChainName)
 		if err != nil {
-			return fmt.Errorf("failed to get rules from iptables chain \"%s\": %v", ipvsHairpinChainName, err)
+			return fmt.Errorf("failed to get rules from iptables chain \"%s\": %w", ipvsHairpinChainName, err)
 		}
 
 		// Apply the rules we need
 		for rule, ruleArgs := range rulesNeeded {
-			ruleExists := false
-			for _, ruleFromNode := range rulesFromNode {
-				if rule == ruleFromNode {
-					ruleExists = true
-					break
-				}
-			}
+			ruleExists := slices.Contains(rulesFromNode, rule)
 			if !ruleExists {
 				err = iptablesCmdHandler.AppendUnique("nat", ipvsHairpinChainName, ruleArgs...)
 				if err != nil {
-					return fmt.Errorf("failed to apply hairpin iptables rule: %v", err)
+					return fmt.Errorf("failed to apply hairpin iptables rule: %w", err)
 				}
 			}
 		}
@@ -1441,19 +1423,11 @@ func (nsc *NetworkServicesController) deleteHairpinIptablesRules(family v1.IPFam
 	// TODO: Factor out this code
 	chains, err := iptablesCmdHandler.ListChains("nat")
 	if err != nil {
-		return errors.New("Failed to list iptables chains: " + err.Error())
+		return fmt.Errorf("failed to list iptables chains: %w", err)
 	}
 
 	// TODO: Factor these variables out
-	hasHairpinChain := false
-
-	// TODO: Factor out this code
-	for _, chain := range chains {
-		if chain == ipvsHairpinChainName {
-			hasHairpinChain = true
-			break
-		}
-	}
+	hasHairpinChain := slices.Contains(chains, ipvsHairpinChainName)
 
 	// Nothing left to do if hairpin chain doesn't exist
 	if !hasHairpinChain {
@@ -1464,7 +1438,7 @@ func (nsc *NetworkServicesController) deleteHairpinIptablesRules(family v1.IPFam
 	jumpArgs := []string{"-m", "ipvs", "--vdir", "ORIGINAL", "-j", ipvsHairpinChainName}
 	hasHairpinJumpRule, err := iptablesCmdHandler.Exists("nat", "POSTROUTING", jumpArgs...)
 	if err != nil {
-		return fmt.Errorf("failed to search POSTROUTING iptables rules: %v", err)
+		return fmt.Errorf("failed to search POSTROUTING iptables rules: %w", err)
 	}
 
 	// Delete the jump rule to the hairpin chain
@@ -1480,11 +1454,11 @@ func (nsc *NetworkServicesController) deleteHairpinIptablesRules(family v1.IPFam
 	// Flush and delete the chain for hairpin rules
 	err = iptablesCmdHandler.ClearChain("nat", ipvsHairpinChainName)
 	if err != nil {
-		return fmt.Errorf("failed to flush iptables chain \"%s\": %v", ipvsHairpinChainName, err)
+		return fmt.Errorf("failed to flush iptables chain \"%s\": %w", ipvsHairpinChainName, err)
 	}
 	err = iptablesCmdHandler.DeleteChain("nat", ipvsHairpinChainName)
 	if err != nil {
-		return fmt.Errorf("failed to delete iptables chain \"%s\": %v", ipvsHairpinChainName, err)
+		return fmt.Errorf("failed to delete iptables chain \"%s\": %w", ipvsHairpinChainName, err)
 	}
 
 	return nil
@@ -1494,13 +1468,13 @@ func (nsc *NetworkServicesController) deleteMasqueradeIptablesRule() error {
 	for _, iptablesCmdHandler := range nsc.iptablesCmdHandlers {
 		postRoutingChainRules, err := iptablesCmdHandler.List("nat", "POSTROUTING")
 		if err != nil {
-			return errors.New("Failed to list iptables rules in POSTROUTING chain in nat table" + err.Error())
+			return fmt.Errorf("failed to list iptables rules in POSTROUTING chain in nat table: %w", err)
 		}
 		for i, rule := range postRoutingChainRules {
 			if strings.Contains(rule, "ipvs") && strings.Contains(rule, "SNAT") {
 				err = iptablesCmdHandler.Delete("nat", "POSTROUTING", strconv.Itoa(i))
 				if err != nil {
-					return errors.New("Failed to run iptables command" + err.Error())
+					return fmt.Errorf("failed to run iptables command: %w", err)
 				}
 				klog.V(2).Infof("Deleted iptables masquerade rule: %s", rule)
 				break
@@ -1560,14 +1534,21 @@ func ipvsDestinationString(d *ipvs.Destination) string {
 	return fmt.Sprintf("%s:%v (Family: %s, Weight: %v)", d.Address, d.Port, family, d.Weight)
 }
 
-func ipvsSetPersistence(svc *ipvs.Service, p bool, timeout int32) {
+func ipvsSetPersistence(svc *ipvs.Service, p bool, timeout int32) error {
 	if p {
+		uTimeout, err := safecast.Convert[uint32](timeout)
+		if err != nil {
+			return fmt.Errorf("failed to convert timeout to uint32: %w", err)
+		}
+
 		svc.Flags |= ipvsPersistentFlagHex
-		svc.Timeout = uint32(timeout)
+		svc.Timeout = uTimeout
 	} else {
 		svc.Flags &^= ipvsPersistentFlagHex
 		svc.Timeout = 0
 	}
+
+	return nil
 }
 
 func ipvsSetSchedFlags(svc *ipvs.Service, s schedFlags) {
@@ -1608,24 +1589,30 @@ func changedIpvsSchedFlags(svc *ipvs.Service, s schedFlags) bool {
 }
 
 // setupMangleTableRule: sets up iptables rule to FWMARK the traffic to external IP vip
-func (nsc *NetworkServicesController) setupMangleTableRule(ip string, protocol string, port string, fwmark string,
-	tcpMSS int) error {
+func (nsc *NetworkServicesController) setupMangleTableRule(ip string, protocol string, port string,
+	fwmark string) error {
 	var iptablesCmdHandler utils.IPTablesHandler
+	tcpMSS := nsc.mtu
 	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("invalid IP address: %s", ip)
+	}
 	if parsedIP.To4() != nil {
 		iptablesCmdHandler = nsc.iptablesCmdHandlers[v1.IPv4Protocol]
+		tcpMSS -= 2*ipv4.HeaderLen + tcpHeaderMinLen
 	} else {
 		iptablesCmdHandler = nsc.iptablesCmdHandlers[v1.IPv6Protocol]
+		tcpMSS -= 2*ipv6.HeaderLen + tcpHeaderMinLen
 	}
 
 	args := []string{"-d", ip, "-m", protocol, "-p", protocol, "--dport", port, "-j", "MARK", "--set-mark", fwmark}
 	err := iptablesCmdHandler.AppendUnique("mangle", "PREROUTING", args...)
 	if err != nil {
-		return fmt.Errorf("failed to run iptables command to set up FWMARK due to %v", err)
+		return fmt.Errorf("failed to run iptables command to set up FWMARK due to %w", err)
 	}
 	err = iptablesCmdHandler.AppendUnique("mangle", "OUTPUT", args...)
 	if err != nil {
-		return fmt.Errorf("failed to run iptables command to set up FWMARK due to %v", err)
+		return fmt.Errorf("failed to run iptables command to set up FWMARK due to %w", err)
 	}
 
 	// setup iptables rule TCPMSS for DSR mode to fix mtu problem
@@ -1635,7 +1622,7 @@ func (nsc *NetworkServicesController) setupMangleTableRule(ip string, protocol s
 			"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", strconv.Itoa(tcpMSS)}
 		err = iptablesCmdHandler.AppendUnique("mangle", "PREROUTING", mtuArgs...)
 		if err != nil {
-			return fmt.Errorf("failed to run iptables command to set up TCPMSS due to %v", err)
+			return fmt.Errorf("failed to run iptables command to set up TCPMSS due to %w", err)
 		}
 	}
 
@@ -1648,13 +1635,64 @@ func (nsc *NetworkServicesController) setupMangleTableRule(ip string, protocol s
 		klog.V(2).Infof("looking for mangle rule with: %s -t mangle %s", chain, prevMTUArgs)
 		exists, err := iptablesCmdHandler.Exists("mangle", chain, prevMTUArgs...)
 		if err != nil {
-			return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %v", err)
+			return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %w", err)
 		}
 		if exists {
 			klog.V(2).Infof("removing mangle rule with: iptables -D %s -t mangle %s", chain, prevMTUArgs)
 			err = iptablesCmdHandler.Delete("mangle", chain, prevMTUArgs...)
 			if err != nil {
-				return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %v", err)
+				return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %w", err)
+			}
+		}
+	}
+
+	// Clean up old IPv6 rules that were created with the incorrect MSS value (MTU-60 instead of MTU-100).
+	// Prior to commit ee0940b8, IPv6 rules incorrectly used the same MSS calculation as IPv4 (MTU-60),
+	// resulting in IPv6 rules with MSS=1440 instead of the correct MSS=1400 (for MTU=1500).
+	// This cleanup ensures these old incorrect rules are removed during upgrades.
+	// TODO: remove after v2.4.X or above
+	if parsedIP.To4() == nil && protocol == tcpProtocol {
+		// Calculate what the old incorrect MSS would have been (using IPv4 calculation for IPv6)
+		oldIncorrectIPv6MSS := nsc.mtu - 2*ipv4.HeaderLen - tcpHeaderMinLen
+
+		// Only proceed if the old incorrect value differs from the current correct value
+		if oldIncorrectIPv6MSS != tcpMSS {
+			klog.V(2).Infof("checking for old incorrect IPv6 TCPMSS rules with MSS %d (correct is %d)",
+				oldIncorrectIPv6MSS, tcpMSS)
+
+			// Check for old-style rules (POSTROUTING with -s, PREROUTING with -d)
+			for firstArg, chain := range map[string]string{"-s": "POSTROUTING", "-d": "PREROUTING"} {
+				oldIncorrectArgs := []string{firstArg, ip, "-m", tcpProtocol, "-p", tcpProtocol,
+					"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", strconv.Itoa(oldIncorrectIPv6MSS)}
+				exists, err := iptablesCmdHandler.Exists("mangle", chain, oldIncorrectArgs...)
+				if err != nil {
+					return fmt.Errorf("failed to check for old incorrect IPv6 TCPMSS rule in %s due to %w", chain, err)
+				}
+				if exists {
+					klog.V(2).Infof("removing old incorrect IPv6 TCPMSS rule with MSS %d: ip6tables -D %s -t mangle %v",
+						oldIncorrectIPv6MSS, chain, oldIncorrectArgs)
+					err = iptablesCmdHandler.Delete("mangle", chain, oldIncorrectArgs...)
+					if err != nil {
+						return fmt.Errorf("failed to delete old incorrect IPv6 TCPMSS rule from %s due to %w", chain, err)
+					}
+				}
+			}
+
+			// Check for current-style rule format with incorrect MSS
+			currentFormatOldMSS := []string{"-s", ip, "-m", tcpProtocol, "-p", tcpProtocol, "--sport", port,
+				"-i", "kube-bridge", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS",
+				"--set-mss", strconv.Itoa(oldIncorrectIPv6MSS)}
+			exists, err := iptablesCmdHandler.Exists("mangle", "PREROUTING", currentFormatOldMSS...)
+			if err != nil {
+				return fmt.Errorf("failed to check for old incorrect IPv6 TCPMSS rule (current format) due to %w", err)
+			}
+			if exists {
+				klog.V(2).Infof("removing old incorrect IPv6 TCPMSS rule (current format) with MSS %d",
+					oldIncorrectIPv6MSS)
+				err = iptablesCmdHandler.Delete("mangle", "PREROUTING", currentFormatOldMSS...)
+				if err != nil {
+					return fmt.Errorf("failed to delete old incorrect IPv6 TCPMSS rule (current format) due to %w", err)
+				}
 			}
 		}
 	}
@@ -1663,36 +1701,42 @@ func (nsc *NetworkServicesController) setupMangleTableRule(ip string, protocol s
 }
 
 func (nsc *NetworkServicesController) cleanupMangleTableRule(ip string, protocol string, port string,
-	fwmark string, tcpMSS int) error {
+	fwmark string) error {
 	var iptablesCmdHandler utils.IPTablesHandler
+	tcpMSS := nsc.mtu
 	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("invalid IP address: %s", ip)
+	}
 	if parsedIP.To4() != nil {
 		iptablesCmdHandler = nsc.iptablesCmdHandlers[v1.IPv4Protocol]
+		tcpMSS -= 2*ipv4.HeaderLen + tcpHeaderMinLen
 	} else {
 		iptablesCmdHandler = nsc.iptablesCmdHandlers[v1.IPv6Protocol]
+		tcpMSS -= 2*ipv6.HeaderLen + tcpHeaderMinLen
 	}
 
 	args := []string{"-d", ip, "-m", protocol, "-p", protocol, "--dport", port, "-j", "MARK", "--set-mark", fwmark}
 	exists, err := iptablesCmdHandler.Exists("mangle", "PREROUTING", args...)
 	if err != nil {
-		return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %v", err)
+		return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %w", err)
 	}
 	if exists {
 		klog.V(2).Infof("removing mangle rule with: iptables -D PREROUTING -t mangle %s", args)
 		err = iptablesCmdHandler.Delete("mangle", "PREROUTING", args...)
 		if err != nil {
-			return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %v", err)
+			return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %w", err)
 		}
 	}
 	exists, err = iptablesCmdHandler.Exists("mangle", "OUTPUT", args...)
 	if err != nil {
-		return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %v", err)
+		return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %w", err)
 	}
 	if exists {
 		klog.V(2).Infof("removing mangle rule with: iptables -D OUTPUT -t mangle %s", args)
 		err = iptablesCmdHandler.Delete("mangle", "OUTPUT", args...)
 		if err != nil {
-			return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %v", err)
+			return fmt.Errorf("failed to cleanup iptables command to set up FWMARK due to %w", err)
 		}
 	}
 
@@ -1703,13 +1747,13 @@ func (nsc *NetworkServicesController) cleanupMangleTableRule(ip string, protocol
 			"--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", strconv.Itoa(tcpMSS)}
 		exists, err = iptablesCmdHandler.Exists("mangle", "PREROUTING", mtuArgs...)
 		if err != nil {
-			return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %v", err)
+			return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %w", err)
 		}
 		if exists {
 			klog.V(2).Infof("removing mangle rule with: iptables -D PREROUTING -t mangle %s", args)
 			err = iptablesCmdHandler.Delete("mangle", "PREROUTING", mtuArgs...)
 			if err != nil {
-				return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %v", err)
+				return fmt.Errorf("failed to cleanup iptables command to set up TCPMSS due to %w", err)
 			}
 		}
 	}
@@ -1720,24 +1764,40 @@ func (nsc *NetworkServicesController) cleanupMangleTableRule(ip string, protocol
 // For DSR it is required that we dont assign the VIP to any interface to avoid martian packets
 // http://www.austintek.com/LVS/LVS-HOWTO/HOWTO/LVS-HOWTO.routing_to_VIP-less_director.html
 // routeVIPTrafficToDirector: setups policy routing so that FWMARKed packets are delivered locally
-func routeVIPTrafficToDirector(fwmark string, family v1.IPFamily) error {
-	ipArgs := make([]string, 0)
+// This is a variable to allow mocking in tests
+var routeVIPTrafficToDirector = func(fwmark uint32, family v1.IPFamily) error {
+	nFamily := netlink.FAMILY_V4
 	if family == v1.IPv6Protocol {
-		ipArgs = append(ipArgs, "-6")
+		nFamily = netlink.FAMILY_V6
 	}
 
-	out, err := runIPCommandsWithArgs(ipArgs, "rule", "list").Output()
+	nRule := netlink.NewRule()
+	nRule.Family = nFamily
+	nRule.Mark = fwmark
+	nRule.Table = customDSRRouteTableID
+	nRule.Priority = defaultTrafficDirectorRulePriority
+
+	routes, err := nlretry.RuleListFiltered(context.Background(), nFamily, nRule,
+		netlink.RT_FILTER_MARK|netlink.RT_FILTER_TABLE|netlink.RT_FILTER_PRIORITY)
 	if err != nil {
-		return errors.New("Failed to verify if `ip rule` exists due to: " + err.Error())
+		return fmt.Errorf("failed to verify if `ip rule` exists due to: %w", err)
 	}
-	if !strings.Contains(string(out), fwmark+" ") {
-		err = runIPCommandsWithArgs(ipArgs, "rule", "add", "prio", "32764", "fwmark", fwmark, "table",
-			customDSRRouteTableID).Run()
+
+	if len(routes) < 1 {
+		klog.V(1).Infof("adding policy rule (%s) to lookup traffic to VIP through the custom routing table", nRule)
+		err = netlink.RuleAdd(nRule)
 		if err != nil {
-			return errors.New("Failed to add policy rule to lookup traffic to VIP through the custom " +
-				" routing table due to " + err.Error())
+			return fmt.Errorf("failed to add policy rule to lookup traffic to VIP through the custom "+
+				"routing table due to: %v", err)
+		}
+	} else {
+		klog.V(1).Infof("policy rule (%s) for mark %d already exists, skipping", nRule, fwmark)
+		klog.V(1).Info("Routes Found:")
+		for _, route := range routes {
+			klog.V(1).Infof("Route: %+v with mark %d", route, route.Mark)
 		}
 	}
+
 	return nil
 }
 
@@ -1752,9 +1812,10 @@ func isEndpointsForLeaderElection(ep *v1.Endpoints) bool {
 	return isLeaderElection
 }
 
-// unique identifier for a load-balanced service (namespace + name + portname)
+// unique identifier for a load-balanced service (namespace + name + portname), joined with "/" because all three
+// parts may contain "-" but never "/", so no two services can share an ID
 func generateServiceID(namespace, svcName, port string) string {
-	return namespace + "-" + svcName + "-" + port
+	return namespace + "/" + svcName + "/" + port
 }
 
 // unique identifier for a load-balanced service (namespace + name + portname)
@@ -1788,7 +1849,7 @@ func (nsc *NetworkServicesController) Cleanup() {
 	if len(nsc.iptablesCmdHandlers) < 1 {
 		// Even though we have a config at this point (via passed param), we want to send nil so that the node will
 		// discover which IP address families it has and act accordingly
-		err = nsc.setupHandlers(nil, nil)
+		err = nsc.setupHandlers(nil)
 		if err != nil {
 			klog.Errorf("could not cleanup because we couldn't create iptables/ipset command handlers due to: %v", err)
 		}
@@ -1822,15 +1883,15 @@ func (nsc *NetworkServicesController) Cleanup() {
 	nsc.cleanupIpvsFirewall()
 
 	// delete dummy interface used to assign cluster IP's
-	dummyVipInterface, err := netlink.LinkByName(KubeDummyIf)
+	dummyVipInterface, err := nlretry.LinkByName(context.Background(), KubeDummyIf)
 	if err != nil {
-		if err.Error() != IfaceNotFound {
-			klog.Infof("Dummy interface: " + KubeDummyIf + " does not exist")
+		if _, notFound := errors.AsType[netlink.LinkNotFoundError](err); notFound {
+			klog.Infof("Dummy interface: %s does not exist", KubeDummyIf)
 		}
 	} else {
 		err = netlink.LinkDel(dummyVipInterface)
 		if err != nil {
-			klog.Errorf("Could not delete dummy interface " + KubeDummyIf + " due to " + err.Error())
+			klog.Errorf("could not delete dummy interface %s due to: %v", KubeDummyIf, err)
 			return
 		}
 	}
@@ -1840,21 +1901,21 @@ func (nsc *NetworkServicesController) Cleanup() {
 
 func (nsc *NetworkServicesController) newEndpointSliceEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			nsc.handleEndpointSliceAdd(obj)
 
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			nsc.handleEndpointSliceUpdate(oldObj, newObj)
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			nsc.handleEndpointSliceDelete(obj)
 		},
 	}
 }
 
-func (nsc *NetworkServicesController) handleEndpointSliceAdd(obj interface{}) {
-	endpoints, ok := obj.(*discovery.EndpointSlice)
+func (nsc *NetworkServicesController) handleEndpointSliceAdd(obj any) {
+	endpoints, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
 		klog.Errorf("unexpected object type: %v", obj)
 		return
@@ -1862,13 +1923,13 @@ func (nsc *NetworkServicesController) handleEndpointSliceAdd(obj interface{}) {
 	nsc.OnEndpointsUpdate(endpoints)
 }
 
-func (nsc *NetworkServicesController) handleEndpointSliceUpdate(oldObj, newObj interface{}) {
-	_, ok := oldObj.(*discovery.EndpointSlice)
+func (nsc *NetworkServicesController) handleEndpointSliceUpdate(oldObj, newObj any) {
+	_, ok := oldObj.(*discoveryv1.EndpointSlice)
 	if !ok {
 		klog.Errorf("unexpected object type: %v", oldObj)
 		return
 	}
-	newEndpoints, ok := newObj.(*discovery.EndpointSlice)
+	newEndpoints, ok := newObj.(*discoveryv1.EndpointSlice)
 	if !ok {
 		klog.Errorf("unexpected object type: %v", newObj)
 		return
@@ -1876,15 +1937,15 @@ func (nsc *NetworkServicesController) handleEndpointSliceUpdate(oldObj, newObj i
 	nsc.OnEndpointsUpdate(newEndpoints)
 }
 
-func (nsc *NetworkServicesController) handleEndpointSliceDelete(obj interface{}) {
-	endpoints, ok := obj.(*discovery.EndpointSlice)
+func (nsc *NetworkServicesController) handleEndpointSliceDelete(obj any) {
+	endpoints, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
 			klog.Errorf("unexpected object type: %v", obj)
 			return
 		}
-		if endpoints, ok = tombstone.Obj.(*discovery.EndpointSlice); !ok {
+		if endpoints, ok = tombstone.Obj.(*discoveryv1.EndpointSlice); !ok {
 			klog.Errorf("unexpected object type: %v", obj)
 			return
 		}
@@ -1894,19 +1955,19 @@ func (nsc *NetworkServicesController) handleEndpointSliceDelete(obj interface{})
 
 func (nsc *NetworkServicesController) newSvcEventHandler() cache.ResourceEventHandler {
 	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
+		AddFunc: func(obj any) {
 			nsc.handleServiceAdd(obj)
 		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
+		UpdateFunc: func(oldObj, newObj any) {
 			nsc.handleServiceUpdate(oldObj, newObj)
 		},
-		DeleteFunc: func(obj interface{}) {
+		DeleteFunc: func(obj any) {
 			nsc.handleServiceDelete(obj)
 		},
 	}
 }
 
-func (nsc *NetworkServicesController) handleServiceAdd(obj interface{}) {
+func (nsc *NetworkServicesController) handleServiceAdd(obj any) {
 	service, ok := obj.(*v1.Service)
 	if !ok {
 		klog.Errorf("unexpected object type: %v", obj)
@@ -1915,7 +1976,7 @@ func (nsc *NetworkServicesController) handleServiceAdd(obj interface{}) {
 	nsc.OnServiceUpdate(service)
 }
 
-func (nsc *NetworkServicesController) handleServiceUpdate(oldObj, newObj interface{}) {
+func (nsc *NetworkServicesController) handleServiceUpdate(oldObj, newObj any) {
 	_, ok := oldObj.(*v1.Service)
 	if !ok {
 		klog.Errorf("unexpected object type: %v", oldObj)
@@ -1929,7 +1990,7 @@ func (nsc *NetworkServicesController) handleServiceUpdate(oldObj, newObj interfa
 	nsc.OnServiceUpdate(newService)
 }
 
-func (nsc *NetworkServicesController) handleServiceDelete(obj interface{}) {
+func (nsc *NetworkServicesController) handleServiceDelete(obj any) {
 	service, ok := obj.(*v1.Service)
 	if !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
@@ -1947,35 +2008,16 @@ func (nsc *NetworkServicesController) handleServiceDelete(obj interface{}) {
 
 // setupHandlers Here we test to see whether the node is IPv6 capable, if the user has enabled IPv6 (via command-line
 // options) and the node has an IPv6 address, the following method will return an IPv6 address
-func (nsc *NetworkServicesController) setupHandlers(config *options.KubeRouterConfig, node *v1.Node) error {
-	// node being nil covers the case where this function is called by something that doesn't have a kube-apiserver
-	// connection like the cleanup code. In this instance we want all possible iptables and ipset handlers
-	if node != nil {
-		nsc.nodeIPv4Addrs, nsc.nodeIPv6Addrs = utils.GetAllNodeIPs(node)
-	}
-
-	// We test for nil configs as the Cleanup() method often doesn't have a valid config in this respect, so rather
-	// than trying to guess options, it is better to just let the logic fallthrough. For the primary path to this func,
-	// NewNetworkServicesController, the config will not be nil and we want to check that we have options that match
-	// the node's capability to ensure sanity later down the road.
-	if config != nil {
-		if config.EnableIPv4 && len(nsc.nodeIPv4Addrs[v1.NodeInternalIP]) < 1 &&
-			len(nsc.nodeIPv4Addrs[v1.NodeExternalIP]) < 1 {
-			return fmt.Errorf("IPv4 was enabled, but no IPv4 address was found on the node")
-		}
-	}
-	nsc.isIPv4Capable = len(nsc.nodeIPv4Addrs) > 0
-	if config != nil {
-		if config.EnableIPv6 && len(nsc.nodeIPv6Addrs[v1.NodeInternalIP]) < 1 &&
-			len(nsc.nodeIPv6Addrs[v1.NodeExternalIP]) < 1 {
-			return fmt.Errorf("IPv6 was enabled, but no IPv6 address was found on the node")
-		}
-	}
-	nsc.isIPv6Capable = len(nsc.nodeIPv6Addrs) > 0
-
+// TODO: replace klog.Fatalf with Errorf and return error, then remove nolint comment below
+//
+//nolint:unparam
+func (nsc *NetworkServicesController) setupHandlers(node *v1.Node) error {
 	nsc.ipSetHandlers = make(map[v1.IPFamily]utils.IPSetHandler)
 	nsc.iptablesCmdHandlers = make(map[v1.IPFamily]utils.IPTablesHandler)
-	if node == nil || len(nsc.nodeIPv4Addrs) > 0 {
+
+	// node being nil covers the case where this function is called by something that doesn't have a kube-apiserver
+	// connection like the cleanup code. In this instance we want all possible iptables and ipset handlers
+	if node == nil || nsc.krNode == nil || nsc.krNode.IsIPv4Capable() {
 		iptHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 		if err != nil {
 			klog.Fatalf("Failed to allocate IPv4 iptables handler: %v", err)
@@ -1990,7 +2032,7 @@ func (nsc *NetworkServicesController) setupHandlers(config *options.KubeRouterCo
 		}
 		nsc.ipSetHandlers[v1.IPv4Protocol] = ipset
 	}
-	if node == nil || len(nsc.nodeIPv6Addrs) > 0 {
+	if node == nil || nsc.krNode == nil || nsc.krNode.IsIPv6Capable() {
 		iptHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
 		if err != nil {
 			klog.Fatalf("Failed to allocate IPv6 iptables handler: %v", err)
@@ -2011,9 +2053,8 @@ func (nsc *NetworkServicesController) setupHandlers(config *options.KubeRouterCo
 
 // NewNetworkServicesController returns NetworkServicesController object
 func NewNetworkServicesController(clientset kubernetes.Interface,
-	config *options.KubeRouterConfig, svcInformer cache.SharedIndexInformer,
-	epSliceInformer cache.SharedIndexInformer, podInformer cache.SharedIndexInformer,
-	ipsetMutex *sync.Mutex) (*NetworkServicesController, error) {
+	config *options.KubeRouterConfig, informers Informers,
+	ipsetMutex *sync.Mutex, ipFilter svcip.Filter) (*NetworkServicesController, error) {
 
 	var err error
 	ln, err := newLinuxNetworking(config.ServiceTCPTimeout, config.ServiceTCPFinTimeout, config.ServiceUDPTimeout)
@@ -2021,23 +2062,13 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 		return nil, err
 	}
 
-	nsc := NetworkServicesController{ln: ln, ipsetMutex: ipsetMutex, metricsMap: make(map[string][]string),
+	nsc := NetworkServicesController{ln: ln, ipsetMutex: ipsetMutex,
 		fwMarkMap: map[uint32]string{}}
 
 	if config.MetricsEnabled {
 		// Register the metrics for this controller
-		metrics.DefaultRegisterer.MustRegister(metrics.ControllerIpvsServices)
+		metrics.DefaultRegisterer.MustRegister(&nsc)
 		metrics.DefaultRegisterer.MustRegister(metrics.ControllerIpvsServicesSyncTime)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceBpsIn)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceBpsOut)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceBytesIn)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceBytesOut)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceCPS)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServicePacketsIn)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServicePacketsOut)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServicePpsIn)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServicePpsOut)
-		metrics.DefaultRegisterer.MustRegister(metrics.ServiceTotalConn)
 		nsc.MetricsEnabled = true
 	}
 
@@ -2047,7 +2078,7 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 	nsc.gracefulTermination = config.IpvsGracefulTermination
 	nsc.globalHairpin = config.GlobalHairpinMode
 
-	nsc.serviceMap = make(serviceInfoMap)
+	nsc.setServiceMap(make(serviceInfoMap))
 	nsc.endpointsMap = make(endpointSliceInfoMap)
 	nsc.client = clientset
 
@@ -2066,18 +2097,18 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 	if config.RunRouter {
 		node, err := utils.GetNodeObject(nsc.client, config.HostnameOverride)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get node object due to: %v", err.Error())
+			return nil, fmt.Errorf("failed to get node object due to: %w", err)
 		}
 
 		cidr, err := utils.GetPodCidrFromNodeSpec(node)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get pod CIDR details from Node.spec: %v", err)
+			return nil, fmt.Errorf("failed to get pod CIDR details from Node.spec: %w", err)
 		}
 		nsc.podCidr = cidr
 
 		nsc.podIPv4CIDRs, nsc.podIPv6CIDRs, err = utils.GetPodCIDRsFromNodeSpecDualStack(node)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get pod CIDRs detail from Node.spec: %v", err)
+			return nil, fmt.Errorf("failed to get pod CIDRs detail from Node.spec: %w", err)
 		}
 	}
 
@@ -2085,57 +2116,79 @@ func NewNetworkServicesController(clientset kubernetes.Interface,
 	for i, excludedCidr := range config.ExcludedCidrs {
 		_, ipnet, err := net.ParseCIDR(excludedCidr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get excluded CIDR details: %v", err)
+			return nil, fmt.Errorf("failed to get excluded CIDR details: %w", err)
 		}
 		nsc.excludedCidrs[i] = *ipnet
 	}
+
+	nsc.ipFilter = ipFilter
 
 	node, err := utils.GetNodeObject(clientset, config.HostnameOverride)
 	if err != nil {
 		return nil, err
 	}
 
-	nsc.nodeHostName = node.Name
-	// We preserve the old logic here for getting the primary IP which is set on nrc.primaryIP. This can be either IPv4
-	// or IPv6
-	nsc.primaryIP, err = utils.GetPrimaryNodeIP(node)
+	nsc.krNode, err = utils.NewKRNode(node, nil, config.EnableIPv4, config.EnableIPv6)
 	if err != nil {
 		return nil, err
 	}
 
-	err = nsc.setupHandlers(config, node)
+	// This function is responsible for quite a bit:
+	// * Sets nsc.nodeIPv4Addrs & nsc.isIPv4Capable
+	// * Sets nsc.nodeIPv6Addr & nsc.isIPv6Capable
+	// * Creates the iptables handlers for ipv4 & ipv6
+	// * Creates the ipset handlers for ipv4 & ipv6
+	err = nsc.setupHandlers(node)
 	if err != nil {
 		return nil, err
 	}
 
-	automtu, err := utils.GetMTUFromNodeIP(nsc.primaryIP)
+	automtu, err := nsc.krNode.GetNodeMTU()
 	if err != nil {
 		return nil, err
 	}
-	// Sets it to 60 bytes less than the auto-detected MTU to account for additional ip-ip headers needed for DSR, above
-	// method GetMTUFromNodeIP() already accounts for the overhead of ip-ip overlay networking, so we need to
-	// remove 60 bytes (internet headers and additional ip-ip because MTU includes internet headers. MSS does not.)
-	// This needs also a condition to deal with auto-mtu=false
-	nsc.dsrTCPMSS = automtu - utils.IPInIPHeaderLength*3
+	// Store MTU only. Code setting MSS will handle address family, and calculate correct MSS.
+	nsc.mtu = automtu
 
-	nsc.podLister = podInformer.GetIndexer()
+	nsc.podLister = informers.Pods().GetIndexer()
 
+	svcInformer := informers.Services()
 	nsc.svcLister = svcInformer.GetIndexer()
 	nsc.ServiceEventHandler = nsc.newSvcEventHandler()
 
 	nsc.ipvsPermitAll = config.IpvsPermitAll
 
+	epSliceInformer := informers.EndpointSlices()
 	nsc.epSliceLister = epSliceInformer.GetIndexer()
 	nsc.EndpointSliceEventHandler = nsc.newEndpointSliceEventHandler()
+
+	// We register our own handlers here so that the wiring lives next to the handlers themselves. The informer
+	// factory has already been started by this point, which is fine, a SharedIndexInformer replays existing
+	// objects as synthetic adds to handlers that join late.
+	if _, err := svcInformer.AddEventHandler(nsc.ServiceEventHandler); err != nil {
+		return nil, fmt.Errorf("failed to add ServiceEventHandler: %w", err)
+	}
+	if _, err := epSliceInformer.AddEventHandler(nsc.EndpointSliceEventHandler); err != nil {
+		return nil, fmt.Errorf("failed to add EndpointSliceEventHandler: %w", err)
+	}
 
 	// Not creating the hairpin controller for now because this should be handled at the CNI level. The CNI bridge
 	// plugin ensures that hairpin mode is set much more reliably than we do. However, as a lot of work was put into
 	// the hairpin controller, and so that it is around to reference in the future if needed, I'm leaving the code
 	// for now.
-	// nsc.hpEndpointReceiver = make(chan string)
+	// nsc.hpEndpointReceiver = make(chan hairpinEndpoint)
 	// nsc.hpc = NewHairpinController(&nsc, nsc.hpEndpointReceiver)
 
 	nsc.nphc = NewNodePortHealthCheck()
 
 	return &nsc, nil
+}
+
+func (nsc *NetworkServicesController) setServiceMap(serviceMap serviceInfoMap) {
+	nsc.serviceMap.Store(&serviceMap)
+	nsc.metricsServiceMap.Store(nil)
+}
+
+func (nsc *NetworkServicesController) getServiceMap() serviceInfoMap {
+	return *nsc.serviceMap.Load()
 }

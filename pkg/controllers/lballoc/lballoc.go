@@ -3,13 +3,17 @@ package lballoc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/cloudnativelabs/kube-router/v2/pkg/healthcheck"
 	"github.com/cloudnativelabs/kube-router/v2/pkg/options"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/svcip"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
 	v1core "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -28,6 +32,12 @@ type ipRanges struct {
 	currentIP  net.IP
 }
 
+// Informers is the set of shared informers the LBC reads from. We declare it here rather than accepting a
+// full informer factory so that the controller can only reach the resources it actually watches.
+type Informers interface {
+	Services() cache.SharedIndexInformer
+}
+
 type LoadBalancerController struct {
 	ipv4Ranges   *ipRanges
 	ipv6Ranges   *ipRanges
@@ -38,6 +48,7 @@ type LoadBalancerController struct {
 	clientset    kubernetes.Interface
 	isDefault    bool
 	syncPeriod   time.Duration
+	unitTestWG   *sync.WaitGroup
 }
 
 func getNamespace() (namespace string, err error) {
@@ -88,7 +99,7 @@ func (ir *ipRanges) inc() {
 	// Increment the current IP address
 	// 10.0.0.3 will increment to 10.0.0.4
 	// 10.0.0.255 will increment to 10.0.1.0
-	for i := len(ci) - 1; i >= 0; i-- {
+	for i := range slices.Backward(ci) {
 		ci[i]++
 		if ci[i] > 0 { // if the byte didn't overflow to zero, don't increment the byte to the left
 			break
@@ -142,19 +153,14 @@ func (ir *ipRanges) Len() int {
 }
 
 func (ir *ipRanges) Contains(ip net.IP) bool {
-	for _, in := range ir.ipRanges {
-		if in.Contains(ip) {
-			return true
-		}
-	}
-	return false
+	return utils.IsIPInRanges(ip, ir.ipRanges)
 }
 
 func (lbc *LoadBalancerController) runLeaderElection(ctx context.Context, isLeaderChan chan<- bool) {
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lbc.lock,
 		ReleaseOnCancel: true,
-		LeaseDuration:   15 * time.Second, //nolint:gomnd // No reason for a 15 second constant
+		LeaseDuration:   15 * time.Second, //nolint:mnd // No reason for a 15 second constant
 		RenewDeadline:   10 * time.Second,
 		RetryPeriod:     2 * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
@@ -169,16 +175,16 @@ func (lbc *LoadBalancerController) runLeaderElection(ctx context.Context, isLead
 	})
 }
 
-func (lbc *LoadBalancerController) OnAdd(obj interface{}, isInitialList bool) {
+func (lbc *LoadBalancerController) OnAdd(obj any, isInitialList bool) {
 	if svc, ok := obj.(*v1core.Service); ok {
 		lbc.addChan <- *svc
 	}
 }
 
-func (lbc *LoadBalancerController) OnDelete(obj interface{}) {
+func (lbc *LoadBalancerController) OnDelete(obj any) {
 }
 
-func (lbc *LoadBalancerController) OnUpdate(oldObj interface{}, newObj interface{}) {
+func (lbc *LoadBalancerController) OnUpdate(oldObj any, newObj any) {
 	if svc, ok := newObj.(*v1core.Service); ok {
 		lbc.addChan <- *svc
 	}
@@ -346,6 +352,12 @@ func appendIngressIP(svc *v1core.Service, ip net.IP) {
 }
 
 func (lbc *LoadBalancerController) updateService(svc *v1core.Service, ips ...net.IP) {
+	// This is only non-nil during certain unit tests that need to understand when this goroutine is finished to remove
+	// chance of race conditions
+	if lbc.unitTestWG != nil {
+		defer lbc.unitTestWG.Done()
+	}
+
 	if lbc.clientset == nil {
 		panic("clientset")
 	}
@@ -387,18 +399,32 @@ func (lbc *LoadBalancerController) allocateService(svc *v1core.Service) error {
 	if want6 && !have6 {
 		ipv6, err6 = lbc.ipv6Ranges.getNextFreeIP(allocated6)
 	}
-	err := err6
+
+	// If no allocation was needed, the service already has all requested IPs
+	if ipv4 == nil && ipv6 == nil && err4 == nil && err6 == nil {
+		return nil
+	}
+
+	var errs []error
 	if err4 != nil {
-		err = err4
+		errs = append(errs, fmt.Errorf("IPv4: %w", err4))
+	}
+	if err6 != nil {
+		errs = append(errs, fmt.Errorf("IPv6: %w", err6))
 	}
 
 	if ipv4 == nil && ipv6 == nil {
-		return errors.New("unable to allocate address: " + err.Error())
+		return fmt.Errorf("unable to allocate address: %w", errors.Join(errs...))
 	}
 	if (ipv4 == nil || ipv6 == nil) && requireDual {
-		return errors.New("unable to allocate dual-stack addresses: " + err.Error())
+		return fmt.Errorf("unable to allocate dual-stack addresses: %w", errors.Join(errs...))
 	}
 
+	// This is only non-nil during certain unit tests that need to understand when this goroutine is finished to remove
+	// chance of race conditions
+	if lbc.unitTestWG != nil {
+		lbc.unitTestWG.Add(1)
+	}
 	go lbc.updateService(svc, ipv4, ipv6)
 	return nil
 }
@@ -441,49 +467,38 @@ func (lbc *LoadBalancerController) Run(healthChan chan<- *healthcheck.Controller
 		case isLeader = <-isLeaderChan:
 			if isLeader {
 				klog.Info("became the load balancer controller leader, syncing...")
-				go lbc.walkServices()
+				// Fire the timer instead of spawning our own walk so that the leader sync goes through
+				// the same heartbeat path below and can't overlap with a ticker-driven walk
+				timer.Reset(0)
 			}
 		case svc := <-lbc.addChan:
 			if isLeader && lbc.shouldAllocate(&svc) {
 				lbc.allocateChan <- svc
 			}
 		case <-timer.C:
-			timer.Reset(time.Minute)
-			healthcheck.SendHeartBeat(healthChan, "LBC")
-			if isLeader {
-				go lbc.walkServices()
-			}
+			timer.Reset(lbc.syncPeriod)
+			// walkServices feeds addChan, which only this select drains, so the walk can't run
+			// inline without deadlocking. It has no failure mode to record, hence no RecordSyncResult
+			leader := isLeader
+			go func() {
+				_ = healthcheck.RunSync(healthChan, healthcheck.LoadBalancerController, func() error {
+					if leader {
+						lbc.walkServices()
+					}
+					return nil
+				})
+			}()
 		}
 	}
 }
 
 func NewLoadBalancerController(clientset kubernetes.Interface,
-	config *options.KubeRouterConfig, svcInformer cache.SharedIndexInformer,
+	config *options.KubeRouterConfig, informers Informers,
+	ipRanges svcip.RangeQuerier,
 ) (*LoadBalancerController, error) {
-	ranges4 := make([]net.IPNet, 0)
-	ranges6 := make([]net.IPNet, 0)
-
-	for _, ir := range config.LoadBalancerCIDRs {
-		ip, cidr, err := net.ParseCIDR(ir)
-		if err != nil {
-			return nil, err
-		}
-		if ip.To4() != nil && !config.EnableIPv4 {
-			return nil, errors.New("IPv4 loadbalancer CIDR specified while IPv4 is disabled")
-		}
-		if ip.To4() == nil && !config.EnableIPv6 {
-			return nil, errors.New("IPv6 loadbalancer CIDR specified while IPv6 is disabled")
-		}
-		if ip.To4() != nil {
-			ranges4 = append(ranges4, *cidr)
-		} else {
-			ranges6 = append(ranges6, *cidr)
-		}
-	}
-
 	lbc := &LoadBalancerController{
-		ipv4Ranges:   newipRanges(ranges4),
-		ipv6Ranges:   newipRanges(ranges6),
+		ipv4Ranges:   newipRanges(ipRanges.LoadBalancerIPRanges(v1core.IPv4Protocol)),
+		ipv6Ranges:   newipRanges(ipRanges.LoadBalancerIPRanges(v1core.IPv6Protocol)),
 		addChan:      make(chan v1core.Service),
 		allocateChan: make(chan v1core.Service),
 		clientset:    clientset,
@@ -491,7 +506,14 @@ func NewLoadBalancerController(clientset kubernetes.Interface,
 		syncPeriod:   config.LoadBalancerSyncPeriod,
 	}
 
+	svcInformer := informers.Services()
 	lbc.svcLister = svcInformer.GetIndexer()
+
+	// The controller is its own ResourceEventHandler, see OnAdd/OnUpdate/OnDelete below. We register here so
+	// that the wiring lives next to the handler methods themselves.
+	if _, err := svcInformer.AddEventHandler(lbc); err != nil {
+		return nil, fmt.Errorf("failed to add ServiceEventHandler: %w", err)
+	}
 
 	namespace, err := getNamespace()
 	if err != nil {

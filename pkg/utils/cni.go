@@ -9,48 +9,55 @@ import (
 	"strings"
 )
 
-const (
-	noIPsSpecifiedErrorMsg = "no IP ranges specified"
-)
-
-type cniNetworkConfig struct {
-	FilePath string
-	Conf     *Conf
-	ConfList *ConfList
+type CNINetworkConfig struct {
+	filePath string
+	conf     *Conf
+	confList *ConfList
 }
 
-func NewCNINetworkConfig(cniConfFilePath string) (*cniNetworkConfig, error) {
-	cniNetConf := cniNetworkConfig{
-		FilePath: cniConfFilePath,
+func NewCNINetworkConfig(cniConfFilePath, cniConfTemplateFilePath string) (*CNINetworkConfig, error) {
+	cniNetConf := CNINetworkConfig{
+		filePath: cniConfFilePath,
 	}
 
-	cniFileBytes, err := os.ReadFile(cniConfFilePath)
+	fileDesc, srcFilePath := "configuration file", cniConfFilePath
+	if cniConfTemplateFilePath != "" {
+		fileDesc, srcFilePath = "configuration template file", cniConfTemplateFilePath
+	}
+
+	cniFileBytes, err := os.ReadFile(srcFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("error reading %s: %v", cniConfFilePath, err)
+		return nil, fmt.Errorf("failed to read %s: %w", fileDesc, err)
 	}
 
 	// If we're working with a conflist setup
-	if cniNetConf.IsConfList() {
+	if strings.HasSuffix(strings.ToLower(cniConfFilePath), ".conflist") {
 		confList := new(ConfList)
 		err = json.Unmarshal(cniFileBytes, confList)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load CNI conflist file: %v", err)
+			return nil, fmt.Errorf("failed to parse %s %s as configuration list: %w", fileDesc, srcFilePath, err)
 		}
-		if len(confList.Plugins) == 0 {
-			return nil, fmt.Errorf("CNI config list %s has no plugins", cniConfFilePath)
+		for _, conf := range confList.Plugins {
+			if conf != nil && conf.Type == "bridge" {
+				cniNetConf.conf = conf
+				break
+			}
 		}
-		cniNetConf.ConfList = confList
+		if cniNetConf.conf == nil {
+			return nil, fmt.Errorf("configuration list in %s %s has no bridge plugin", fileDesc, srcFilePath)
+		}
+		cniNetConf.confList = confList
 	} else {
 		// If we're working with a conf setup
 		conf := new(Conf)
 		err = json.Unmarshal(cniFileBytes, conf)
 		if err != nil {
-			return nil, fmt.Errorf("failed to load CNI conf file: %v", err)
+			return nil, fmt.Errorf("failed to parse %s %s: %w", fileDesc, srcFilePath, err)
 		}
 		if conf.Type == "" {
-			return nil, fmt.Errorf("error load CNI config, file appears to have no type: %s", cniConfFilePath)
+			return nil, fmt.Errorf("configuration in %s %s has no type", fileDesc, srcFilePath)
 		}
-		cniNetConf.Conf = conf
+		cniNetConf.conf = conf
 	}
 
 	if err = cniNetConf.consolidateSubnets(); err != nil {
@@ -63,38 +70,31 @@ func NewCNINetworkConfig(cniConfFilePath string) (*cniNetworkConfig, error) {
 // consolidateSubnets Many people still define the legacy single subnet variation of the IPAM plugin instead of the
 // newer ranges variation. To account for this and make parsing simpler, we do the same thing that the official IPAM
 // config loader does and collapse them into ranges.
-func (c *cniNetworkConfig) consolidateSubnets() error {
-	brPlug := c.getBridgePlugin()
-	if brPlug.IPAM.Subnet != "" {
-		err := c.InsertPodCIDRIntoIPAM(brPlug.IPAM.Subnet)
+func (c *CNINetworkConfig) consolidateSubnets() error {
+	if c.conf.IPAM.Subnet != "" {
+		err := c.InsertPodCIDRIntoIPAM(c.conf.IPAM.Subnet)
 		if err != nil {
 			return err
 		}
-		brPlug.IPAM.Subnet = ""
-		delete(brPlug.IPAM.raw, "subnet")
+		c.conf.IPAM.Subnet = ""
+		delete(c.conf.IPAM.raw, "subnet")
 	}
 
 	return nil
 }
 
-// IsConfList checks to see if this CNI configuration is a *.conflist file or if it is a *.conf file. Returns true for
-// *.conflist, returns false for anything else.
-func (c *cniNetworkConfig) IsConfList() bool {
-	return strings.HasSuffix(strings.ToLower(c.FilePath), ".conflist")
+// IsConfList checks to see if this CNI configuration is a conflist or a conf.
+//
+// Deprecated: This is internal state.
+func (c *CNINetworkConfig) IsConfList() bool {
+	return c.confList != nil
 }
 
 // getPodCIDRsMapFromCNISpec gets pod CIDR allocated to the node as a map from CNI spec file and returns it
-func (c *cniNetworkConfig) getPodCIDRsMapFromCNISpec() (map[string]*net.IPNet, error) {
+func (c *CNINetworkConfig) getPodCIDRsMapFromCNISpec() (map[string]*net.IPNet, error) {
 	podCIDRs := make(map[string]*net.IPNet)
-	var err error
 
-	ipamConfig := c.getBridgePlugin().IPAM
-	if err != nil {
-		if err.Error() != noIPsSpecifiedErrorMsg {
-			return nil, err
-		}
-		return nil, nil
-	}
+	ipamConfig := c.conf.IPAM
 
 	// Parse ranges from ipamConfig
 	if ipamConfig != nil && len(ipamConfig.Ranges) > 0 {
@@ -104,7 +104,7 @@ func (c *cniNetworkConfig) getPodCIDRsMapFromCNISpec() (map[string]*net.IPNet, e
 					_, netCIDR, err := net.ParseCIDR(item.Subnet)
 					if err != nil {
 						return nil, fmt.Errorf("unable to parse CIDR '%s' contained in CNI: %s",
-							item.Subnet, c.FilePath)
+							item.Subnet, c.filePath)
 					}
 					podCIDRs[netCIDR.String()] = netCIDR
 				}
@@ -116,7 +116,7 @@ func (c *cniNetworkConfig) getPodCIDRsMapFromCNISpec() (map[string]*net.IPNet, e
 }
 
 // GetPodCIDRsFromCNISpec gets pod CIDR allocated to the node from CNI spec file and returns it
-func (c *cniNetworkConfig) GetPodCIDRsFromCNISpec() ([]*net.IPNet, error) {
+func (c *CNINetworkConfig) GetPodCIDRsFromCNISpec() ([]*net.IPNet, error) {
 	podCIDRMap, err := c.getPodCIDRsMapFromCNISpec()
 	if err != nil {
 		return nil, err
@@ -128,29 +128,17 @@ func (c *cniNetworkConfig) GetPodCIDRsFromCNISpec() ([]*net.IPNet, error) {
 	return podCIDRs, nil
 }
 
-// getBridgePlugin get the bridge plugin configuration out of the cniNetworkConfig in a consistent manner
-func (c *cniNetworkConfig) getBridgePlugin() *Conf {
-	if c.ConfList != nil {
-		for _, conf := range c.ConfList.Plugins {
-			if conf.Type == "bridge" {
-				return conf
-			}
-		}
-	}
-	return c.Conf
-}
-
 // InsertPodCIDRIntoIPAM insert a new cidr into the CNI file. If the CIDR already exists in the CNI ranges, then
 // operation is a noop. Throws an error if either the passed cidr cannot be parsed or if there is a problem with the
 // CIDRs already in the CNI config.
-func (c *cniNetworkConfig) InsertPodCIDRIntoIPAM(cidr string) error {
-	ipamConfig := c.getBridgePlugin().IPAM
+func (c *CNINetworkConfig) InsertPodCIDRIntoIPAM(cidr string) error {
+	ipamConfig := c.conf.IPAM
 
 	// This should have already been sanitized by the GetPodCIDR* functions before it comes to us, but you can never be
 	// too safe...
 	_, _, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return fmt.Errorf("unable to parse input cidr: %s - %v", cidr, err)
+		return fmt.Errorf("unable to parse input cidr: %s - %w", cidr, err)
 	}
 
 	// Check that we don't already have the cidr in our list of ranges already, if so, consider it a no-op
@@ -169,29 +157,28 @@ func (c *cniNetworkConfig) InsertPodCIDRIntoIPAM(cidr string) error {
 	return nil
 }
 
-func (c *cniNetworkConfig) SetMTU(mtu int) {
-	brPlugin := c.getBridgePlugin()
-	brPlugin.MTU = float64(mtu)
+func (c *CNINetworkConfig) SetMTU(mtu int) {
+	c.conf.MTU = float64(mtu)
 }
 
-func (c *cniNetworkConfig) WriteCNIConfig() error {
+func (c *CNINetworkConfig) WriteCNIConfig() error {
 	var cniBytes []byte
 	var err error
-	if c.IsConfList() {
-		cniBytes, err = json.Marshal(c.ConfList)
+	if c.confList != nil {
+		cniBytes, err = json.Marshal(c.confList)
 		if err != nil {
-			return fmt.Errorf("unable to marshal CNI ConfList: %v", err)
+			return fmt.Errorf("unable to marshal CNI ConfList: %w", err)
 		}
 	} else {
-		cniBytes, err = json.Marshal(c.Conf)
+		cniBytes, err = json.Marshal(c.conf)
 		if err != nil {
-			return fmt.Errorf("unable to marshal CNI Conf: %v", err)
+			return fmt.Errorf("unable to marshal CNI Conf: %w", err)
 		}
 	}
 
-	err = os.WriteFile(c.FilePath, cniBytes, 0644)
+	err = os.WriteFile(c.filePath, cniBytes, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to write into CNI conf file: %v", err)
+		return fmt.Errorf("failed to write into CNI conf file: %w", err)
 	}
 
 	return nil
@@ -347,7 +334,7 @@ func PartialJSONUnmarshal(r rawMapAble, bytes []byte) error {
 func isNilOrEmpty(v reflect.Value) bool {
 	//nolint:exhaustive // we don't care about all of the potential types here, only the ones that might trip us up
 	switch v.Kind() {
-	case reflect.Ptr, reflect.Map, reflect.Array, reflect.Chan, reflect.Slice:
+	case reflect.Pointer, reflect.Map, reflect.Array, reflect.Chan, reflect.Slice:
 		return v.IsNil()
 	case reflect.String:
 		return v.Interface() == ""

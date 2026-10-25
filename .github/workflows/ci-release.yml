@@ -1,0 +1,61 @@
+name: ci-release
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: The Go version to use
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs GoReleaser to publish binaries, generate a binary SBOM, and produce SLSA provenance
+  ci-goreleaser-tag:
+    name: ci-goreleaser-tag
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+    # Check out the repository so GoReleaser has access to the full git history and source.
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+    # Install the Go toolchain at the pinned version with module caching enabled.
+    - name: Set up Go
+      uses: ./.github/actions/setup-go
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    # Build multi-arch binaries, create archives, generate checksums, and publish a GitHub release.
+    # The release is created as a draft (see .goreleaser.yml) pending manual review before publish.
+    - name: Run GoReleaser
+      uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94  # v7.2.3
+      with:
+        version: "~> v2"
+        distribution: goreleaser
+        args: release --clean
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # Generate a CycloneDX SBOM covering all release binaries in dist/ and attach it
+    # to the GitHub release as a downloadable asset for binary consumers.
+    - name: Generate SBOM for release binaries
+      uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26  # v0.24.2
+      with:
+        path: ./dist
+        format: cyclonedx-json
+        artifact-name: kube-router-${{ github.ref_name }}-sbom.cyclonedx.json
+        upload-release-assets: true
+
+    # Generate SLSA Build Level 2 provenance for the release binaries.
+    # Uses GitHub's native attestation (first-party action, GA since June 2024).
+    # Consumers can verify with: gh attestation verify <binary> --repo cloudnativelabs/kube-router
+    - name: Generate SLSA provenance for release binaries
+      uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6  # v4.2.2
+      with:
+        subject-checksums: ./dist/checksums.txt

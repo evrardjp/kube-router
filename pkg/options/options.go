@@ -9,10 +9,16 @@ import (
 )
 
 const (
-	DefaultBgpPort                       = 179
-	DefaultBgpHoldTime                   = 90 * time.Second
-	defaultHealthCheckPort               = 20244
-	defaultOverlayTunnelEncapPort uint16 = 5555
+	DefaultBFDPort                  uint32 = 3784
+	DefaultBFDDetectionMultiplier   uint32 = 3
+	DefaultBFDDesiredMinTxInterval  uint32 = 1000 // 1s in milliseconds
+	DefaultBFDRequiredMinRxInterval uint32 = 1000 // 1s in milliseconds
+	DefaultBgpPort                         = 179
+	DefaultBgpHoldTime                     = 90 * time.Second
+	defaultHealthCheckPort                 = 20244
+	defaultOverlayTunnelEncapPort   uint16 = 5555
+	defaultGoBGPAdminAddress               = "127.0.0.1"
+	defaultGoBGPAdminPort           uint16 = 50051
 )
 
 type KubeRouterConfig struct {
@@ -21,6 +27,10 @@ type KubeRouterConfig struct {
 	AdvertiseLoadBalancerIP        bool
 	AdvertiseNodePodCidr           bool
 	AutoMTU                        bool
+	BFDDesiredMinTxInterval        uint32
+	BFDDetectionMultiplier         uint32
+	BFDPort                        uint32
+	BFDRequiredMinRxInterval       uint32
 	BGPGracefulRestart             bool
 	BGPGracefulRestartDeferralTime time.Duration
 	BGPGracefulRestartTime         time.Duration
@@ -31,6 +41,7 @@ type KubeRouterConfig struct {
 	ClusterAsn                     uint
 	ClusterIPCIDRs                 []string
 	DisableSrcDstCheck             bool
+	EnableBFD                      bool
 	EnableCNI                      bool
 	EnableiBGP                     bool
 	EnableIPv4                     bool
@@ -42,6 +53,9 @@ type KubeRouterConfig struct {
 	ExternalIPCIDRs                []string
 	FullMeshMode                   bool
 	GlobalHairpinMode              bool
+	GoBGPAdminAddress              string
+	GoBGPAdminPort                 uint16
+	HealthAddr                     string
 	HealthPort                     uint16
 	HelpRequested                  bool
 	HostnameOverride               string
@@ -61,6 +75,7 @@ type KubeRouterConfig struct {
 	MetricsPath                    string
 	MetricsPort                    uint16
 	MetricsAddr                    string
+	NetPolDefaultDeny              bool
 	NodePortBindOnAllIP            bool
 	NodePortRange                  string
 	OverlayType                    string
@@ -83,13 +98,15 @@ type KubeRouterConfig struct {
 	ServiceTCPTimeout              time.Duration
 	ServiceTCPFinTimeout           time.Duration
 	ServiceUDPTimeout              time.Duration
+	StrictExternalIPValidation     bool
+	UseNftablesForNetpol           bool
 	Version                        bool
 	VLevel                         string
 	// FullMeshPassword    string
 }
 
 func NewKubeRouterConfig() *KubeRouterConfig {
-	//nolint:gomnd // Here we are specifying the names of the literals which is very similar to constant behavior
+	//nolint:mnd // Here we are specifying the names of the literals which is very similar to constant behavior
 	return &KubeRouterConfig{
 		BGPGracefulRestartDeferralTime: 360 * time.Second,
 		BGPGracefulRestartTime:         90 * time.Second,
@@ -117,13 +134,20 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&s.AdvertiseExternalIP, "advertise-external-ip", false,
 		"Add External IP of service to the RIB so that it gets advertised to the BGP peers.")
 	fs.BoolVar(&s.AdvertiseLoadBalancerIP, "advertise-loadbalancer-ip", false,
-		"Add LoadbBalancer IP of service status as set by the LB provider to the RIB so that it gets "+
+		"Add LoadBalancer IP of service status as set by the LB provider to the RIB so that it gets "+
 			"advertised to the BGP peers.")
 	fs.BoolVar(&s.AdvertiseNodePodCidr, "advertise-pod-cidr", true,
 		"Add Node's POD cidr to the RIB so that it gets advertised to the BGP peers.")
 	fs.BoolVar(&s.AutoMTU, "auto-mtu", true,
 		"Auto detect and set the largest possible MTU for kube-bridge and pod interfaces (also accounts for "+
 			"IPIP overlay network when enabled).")
+	fs.Uint32Var(&s.BFDDesiredMinTxInterval, "bfd-desired-min-tx-interval", DefaultBFDDesiredMinTxInterval,
+		"The desired min interval in milliseconds for GoBGP to transmit BFD control packets.")
+	fs.Uint32Var(&s.BFDDetectionMultiplier, "bfd-detection-multiplier", DefaultBFDDetectionMultiplier,
+		"BFD failure detection multiplier. Must be between 1-255.")
+	fs.Uint32Var(&s.BFDPort, "bfd-port", DefaultBFDPort, "UDP port for BFD control packets")
+	fs.Uint32Var(&s.BFDRequiredMinRxInterval, "bfd-required-min-rx-interval", DefaultBFDRequiredMinRxInterval,
+		"Min interval in milliseconds for GoBGP to receive BFD control packets.")
 	fs.BoolVar(&s.BGPGracefulRestart, "bgp-graceful-restart", false,
 		"Enables the BGP Graceful Restart capability so that routes are preserved on unexpected restarts")
 	fs.DurationVar(&s.BGPGracefulRestartDeferralTime, "bgp-graceful-restart-deferral-time",
@@ -132,7 +156,7 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&s.BGPGracefulRestartTime, "bgp-graceful-restart-time", s.BGPGracefulRestartTime,
 		"BGP Graceful restart time according to RFC4724 3, maximum 4095s.")
 	fs.DurationVar(&s.BGPHoldTime, "bgp-holdtime", DefaultBgpHoldTime,
-		"This parameter is mainly used to modify the holdtime declared to BGP peer. When Kube-router goes down "+
+		"This parameter is mainly used to modify the holdtime declared to BGP peer. When kube-router goes down "+
 			"abnormally, the local saving time of BGP route will be affected. "+
 			"Holdtime must be in the range 3s to 18h12m16s.")
 	fs.Uint32Var(&s.BGPPort, "bgp-port", DefaultBgpPort,
@@ -146,6 +170,7 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&s.DisableSrcDstCheck, "disable-source-dest-check", true,
 		"Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be "+
 			"set some other way.")
+	fs.BoolVar(&s.EnableBFD, "enable-bfd", false, "Enable BFD for GoBGP")
 	fs.BoolVar(&s.EnableCNI, "enable-cni", true,
 		"Enable CNI plugin. Disable if you want to use kube-router features alongside another CNI plugin.")
 	fs.BoolVar(&s.EnableiBGP, "enable-ibgp", true,
@@ -164,6 +189,13 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"Excluded CIDRs are used to exclude IPVS rules from deletion.")
 	fs.BoolVar(&s.GlobalHairpinMode, "hairpin-mode", false,
 		"Add iptables rules for every Service Endpoint to support hairpin traffic.")
+	fs.StringVar(&s.GoBGPAdminAddress, "gobgp-admin-address", defaultGoBGPAdminAddress,
+		"Address for GoBGP server. Used in combination with gobgp-admin-port to expose GoBGP for administrative purposes. "+
+			"Setting this to empty string will default the address to 127.0.0.1.")
+	fs.Uint16Var(&s.GoBGPAdminPort, "gobgp-admin-port", defaultGoBGPAdminPort,
+		"Port to connect to GoBGP for administrative purposes. Setting this to 0 will disable the GoBGP gRPC server.")
+	fs.StringVar(&s.HealthAddr, "health-addr", "", "Health check address to listen on (Default: all interfaces; "+
+		"ensure to configure the 'livenessProbe' to use the same IP address)")
 	fs.Uint16Var(&s.HealthPort, "health-port", defaultHealthCheckPort, "Health check port, 0 = Disabled")
 	fs.BoolVarP(&s.HelpRequested, "help", "h", false,
 		"Print usage information.")
@@ -178,7 +210,7 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"The graceful period before removing destinations from IPVS services (e.g. '5s', '1m', '2h22m'). Must "+
 			"be greater than 0.")
 	fs.BoolVar(&s.IpvsGracefulTermination, "ipvs-graceful-termination", false,
-		"Enables the experimental IPVS graceful terminaton capability")
+		"Enables the experimental IPVS graceful termination capability")
 	fs.BoolVar(&s.IpvsPermitAll, "ipvs-permit-all", true,
 		"Enables rule to accept all incoming traffic to service VIP's on the node.")
 	fs.DurationVar(&s.IpvsSyncPeriod, "ipvs-sync-period", s.IpvsSyncPeriod,
@@ -188,7 +220,9 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&s.LoadBalancerDefaultClass, "loadbalancer-default-class", true,
 		"Handle loadbalancer services without a class")
 	fs.StringSliceVar(&s.LoadBalancerCIDRs, "loadbalancer-ip-range", s.LoadBalancerCIDRs,
-		"CIDR values from which loadbalancer services addresses are assigned (can be specified multiple times)")
+		"CIDR values from which loadbalancer services addresses are assigned (can be specified multiple "+
+			"times). Also used by the proxy module to validate loadBalancerIPs when "+
+			"--strict-external-ip-validation is enabled.")
 	fs.DurationVar(&s.LoadBalancerSyncPeriod, "loadbalancer-sync-period", s.LoadBalancerSyncPeriod,
 		"The delay between checking for missed services (e.g. '5s', '1m'). Must be greater than 0.")
 	fs.BoolVar(&s.MasqueradeAll, "masquerade-all", false,
@@ -199,6 +233,8 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.Uint16Var(&s.MetricsPort, "metrics-port", 0, "Prometheus metrics port, (Default 0, Disabled)")
 	fs.StringVar(&s.MetricsAddr, "metrics-addr", "", "Prometheus metrics address to listen on, (Default: all "+
 		"interfaces)")
+	fs.BoolVar(&s.NetPolDefaultDeny, "netpol-default-deny", false,
+		"Default policy to use for pods to have before NetworkPolicy is applied")
 	fs.BoolVar(&s.NodePortBindOnAllIP, "nodeport-bindon-all-ip", false,
 		"For service of NodePort type create IPVS service that listens on all IP's of the node.")
 	fs.BoolVar(&s.FullMeshMode, "nodes-full-mesh", true,
@@ -247,9 +283,15 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 			"containerd.")
 	fs.StringSliceVar(&s.ClusterIPCIDRs, "service-cluster-ip-range", s.ClusterIPCIDRs,
 		"CIDR values from which service cluster IPs are assigned (can be specified up to 2 times)")
+	fs.BoolVar(&s.StrictExternalIPValidation, "strict-external-ip-validation", true,
+		"When enabled, the proxy module validates externalIPs and loadBalancerIPs against configured CIDR "+
+			"ranges (--service-external-ip-range and --loadbalancer-ip-range). When strict mode is enabled "+
+			"and no range is configured, all externalIPs / loadBalancerIPs are rejected (default-deny). "+
+			"Disable this flag to restore previous behavior of accepting all IPs without validation.")
 	fs.StringSliceVar(&s.ExternalIPCIDRs, "service-external-ip-range", s.ExternalIPCIDRs,
-		"Specify external IP CIDRs that are used for inter-cluster communication "+
-			"(can be specified multiple times)")
+		"Specify external IP CIDRs that are used for inter-cluster communication (can be specified "+
+			"multiple times). Also used by the proxy module to validate externalIPs when "+
+			"--strict-external-ip-validation is enabled.")
 	fs.StringVar(&s.NodePortRange, "service-node-port-range", s.NodePortRange,
 		"NodePort range specified with either a hyphen or colon")
 	fs.DurationVar(&s.ServiceTCPTimeout, "service-tcp-timeout", s.ServiceTCPTimeout,
@@ -262,6 +304,9 @@ func (s *KubeRouterConfig) AddFlags(fs *pflag.FlagSet) {
 		"Specify UDP timeout for IPVS services in standard duration syntax (e.g. '5s', '1m'), default 0s preserves "+
 			"default system value (default: 0s)")
 	fs.StringVarP(&s.VLevel, "v", "v", "0", "log level for V logs")
+	fs.BoolVar(&s.UseNftablesForNetpol, "use-nftables-for-netpol", false,
+		"[Experimental] Use nftables instead of iptables for the network policy controller. "+
+			"Requires nft >= 1.0.1 and kernel nftables support. (default false)")
 	fs.BoolVarP(&s.Version, "version", "V", false,
 		"Print version information.")
 }

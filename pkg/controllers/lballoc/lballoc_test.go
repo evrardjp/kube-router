@@ -1,12 +1,15 @@
 package lballoc
 
 import (
+	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cloudnativelabs/kube-router/v2/pkg/options"
+	"github.com/cloudnativelabs/kube-router/v2/pkg/svcip"
 	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
@@ -346,10 +349,10 @@ func TestShouldAllocate(t *testing.T) {
 
 type mockIndexer struct {
 	cache.FakeCustomStore
-	objects []interface{}
+	objects []any
 }
 
-func (mi *mockIndexer) Index(_ string, _ interface{}) ([]interface{}, error) {
+func (mi *mockIndexer) Index(_ string, _ any) ([]any, error) {
 	return nil, errors.New("unsupported")
 }
 
@@ -361,7 +364,7 @@ func (mi *mockIndexer) ListIndexFuncValues(_ string) []string {
 	return nil
 }
 
-func (mi *mockIndexer) ByIndex(_, _ string) ([]interface{}, error) {
+func (mi *mockIndexer) ByIndex(_, _ string) ([]any, error) {
 	return nil, errors.New("unsupported")
 }
 
@@ -373,13 +376,19 @@ func (mi *mockIndexer) AddIndexers(_ cache.Indexers) error {
 	return errors.New("unsupported")
 }
 
-func (mi *mockIndexer) List() []interface{} {
+func (mi *mockIndexer) List() []any {
 	return mi.objects
 }
 
-func newMockIndexer(objects ...interface{}) *mockIndexer {
+func (mi *mockIndexer) Bookmark(_ string) {}
+
+func (mi *mockIndexer) LastStoreSyncResourceVersion() string {
+	return ""
+}
+
+func newMockIndexer(objects ...any) *mockIndexer {
 	mi := &mockIndexer{
-		objects: make([]interface{}, 0),
+		objects: make([]any, 0),
 	}
 	mi.objects = append(mi.objects, objects...)
 	return mi
@@ -572,7 +581,8 @@ func TestAppendIngressIP(t *testing.T) {
 
 func TestAllocateService(t *testing.T) {
 	mlbc := &LoadBalancerController{
-		clientset: fake.NewSimpleClientset(),
+		clientset:  fake.NewSimpleClientset(),
+		unitTestWG: &sync.WaitGroup{},
 	}
 	ir4, ir6 := makeIPRanges("127.127.127.127/30", "ffff::/80")
 	mlbc.ipv4Ranges = ir4
@@ -586,12 +596,13 @@ func TestAllocateService(t *testing.T) {
 		t.Fatalf("expected %v, got %s", nil, err)
 	}
 
+	mlbc.unitTestWG.Wait()
 	svc = makeTestService()
 	mlbc.ipv4Ranges = newipRanges(nil)
 	fp := v1core.IPFamilyPolicyRequireDualStack
 	svc.Spec.IPFamilyPolicy = &fp
 	err = mlbc.allocateService(&svc)
-	errExp := "unable to allocate dual-stack addresses: no IPs left to allocate"
+	errExp := "unable to allocate dual-stack addresses: IPv4: no IPs left to allocate"
 	if errExp != err.Error() {
 		t.Fatalf("expected %s, got %s", errExp, err)
 	}
@@ -599,6 +610,7 @@ func TestAllocateService(t *testing.T) {
 	mlbc.ipv4Ranges = ir4
 	mlbc.ipv6Ranges = newipRanges(nil)
 	err = mlbc.allocateService(&svc)
+	errExp = "unable to allocate dual-stack addresses: IPv6: no IPs left to allocate"
 	if errExp != err.Error() {
 		t.Fatalf("expected %s, got %s", errExp, err)
 	}
@@ -607,12 +619,46 @@ func TestAllocateService(t *testing.T) {
 	fp = v1core.IPFamilyPolicyPreferDualStack
 	svc.Spec.IPFamilyPolicy = &fp
 	err = mlbc.allocateService(&svc)
-	errExp = "unable to allocate address: no IPs left to allocate"
+	errExp = "unable to allocate address: IPv4: no IPs left to allocate\nIPv6: no IPs left to allocate"
 	if errExp != err.Error() {
 		t.Fatalf("expected %s, got %s", errExp, err)
 	}
 
 }
+
+// TestAllocateServiceAlreadyAllocated covers the case where a service already has all
+// requested ingress IPs and no allocation is needed. Before the early-return guard in
+// allocateService, this path would fall through to the error check with nil IPs and nil
+// errors, producing a spurious error (or panic).
+func TestAllocateServiceAlreadyAllocated(t *testing.T) {
+	mlbc := &LoadBalancerController{
+		clientset:  fake.NewSimpleClientset(),
+		unitTestWG: &sync.WaitGroup{},
+	}
+	ir4, ir6 := makeIPRanges("127.127.127.127/30", "ffff::/80")
+	mlbc.ipv4Ranges = ir4
+	mlbc.ipv6Ranges = ir6
+	mi := newMockIndexer()
+	mlbc.svcLister = mi
+
+	svc := makeTestService()
+	// Give the service existing ingress IPs for both families so that
+	// allocateService has nothing to allocate.
+	appendIngressIP(&svc, net.ParseIP("127.127.127.127"))
+	appendIngressIP(&svc, net.ParseIP("ffff::1"))
+
+	err := mlbc.allocateService(&svc)
+	if err != nil {
+		t.Fatalf("expected nil error when service already has all IPs, got: %s", err)
+	}
+}
+
+// testInformers satisfies the package's Informers interface for tests that drive the constructor directly.
+type testInformers struct {
+	services cache.SharedIndexInformer
+}
+
+func (t testInformers) Services() cache.SharedIndexInformer { return t.services }
 
 type mockInformer struct {
 }
@@ -633,6 +679,10 @@ func (mf *mockInformer) AddEventHandlerWithResyncPeriod(_ cache.ResourceEventHan
 	return nil, nil
 }
 
+func (mf *mockInformer) AddEventHandlerWithOptions(_ cache.ResourceEventHandler, _ cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	return nil, nil
+}
+
 func (mf *mockInformer) RemoveEventHandler(_ cache.ResourceEventHandlerRegistration) error {
 	return nil
 }
@@ -648,8 +698,33 @@ func (mf *mockInformer) GetController() cache.Controller {
 func (mf *mockInformer) Run(_ <-chan struct{}) {
 }
 
+func (mf *mockInformer) RunWithContext(_ context.Context) {
+}
+
 func (mf *mockInformer) HasSynced() bool {
 	return false
+}
+
+// mockDoneChecker is a minimal cache.DoneChecker implementation used by the
+// mockInformer to satisfy the SharedInformer interface introduced in
+// client-go v0.36. The channel is closed up-front so callers waiting on
+// Done() unblock immediately, matching the previous "no actual sync" semantics
+// of the surrounding tests.
+type mockDoneChecker struct {
+	done chan struct{}
+}
+
+func newMockDoneChecker() *mockDoneChecker {
+	ch := make(chan struct{})
+	close(ch)
+	return &mockDoneChecker{done: ch}
+}
+
+func (m *mockDoneChecker) Name() string          { return "mockInformer" }
+func (m *mockDoneChecker) Done() <-chan struct{} { return m.done }
+
+func (mf *mockInformer) HasSyncedChecker() cache.DoneChecker {
+	return newMockDoneChecker()
 }
 
 func (mf *mockInformer) LastSyncResourceVersion() string {
@@ -657,6 +732,10 @@ func (mf *mockInformer) LastSyncResourceVersion() string {
 }
 
 func (mf *mockInformer) SetWatchErrorHandler(_ cache.WatchErrorHandler) error {
+	return nil
+}
+
+func (mf *mockInformer) SetWatchErrorHandlerWithContext(_ cache.WatchErrorHandlerWithContext) error {
 	return nil
 }
 
@@ -680,23 +759,41 @@ func TestNewLoadBalancerController(t *testing.T) {
 	}
 	fs := fake.NewSimpleClientset()
 
-	_, err := NewLoadBalancerController(fs, config, mf)
+	validator, validatorErr := svcip.NewValidator(svcip.Config{
+		LoadBalancerCIDRs: config.LoadBalancerCIDRs,
+		ClusterIPCIDRs:    []string{"10.96.0.0/12", "fd00::/112"},
+		EnableIPv4:        config.EnableIPv4,
+		EnableIPv6:        config.EnableIPv6,
+	})
+	if validatorErr != nil {
+		t.Fatalf("expected validator to succeed, got %s", validatorErr)
+	}
+
+	_, err := NewLoadBalancerController(fs, config, testInformers{services: mf}, validator)
 	if err != nil {
 		t.Fatalf("expected %v, got %s", nil, err)
 	}
 
-	config.EnableIPv4 = false
-	_, err = NewLoadBalancerController(fs, config, mf)
-	errExp := "IPv4 loadbalancer CIDR specified while IPv4 is disabled"
-	if err.Error() != errExp {
-		t.Fatalf("expected %s, got %s", errExp, err)
+	// Family-disabled validation is now handled by the validator at startup.
+	// Test that the validator correctly rejects IPv4 CIDRs when IPv4 is disabled.
+	_, validatorErr = svcip.NewValidator(svcip.Config{
+		LoadBalancerCIDRs: config.LoadBalancerCIDRs,
+		ClusterIPCIDRs:    []string{"fd00::/112"},
+		EnableIPv4:        false,
+		EnableIPv6:        true,
+	})
+	if validatorErr == nil {
+		t.Fatal("expected validator to fail with IPv4 disabled, but it succeeded")
 	}
 
-	config.EnableIPv4 = true
-	config.EnableIPv6 = false
-	_, err = NewLoadBalancerController(fs, config, mf)
-	errExp = "IPv6 loadbalancer CIDR specified while IPv6 is disabled"
-	if err.Error() != errExp {
-		t.Fatalf("expected %s, got %s", errExp, err)
+	// Test that the validator correctly rejects IPv6 CIDRs when IPv6 is disabled.
+	_, validatorErr = svcip.NewValidator(svcip.Config{
+		LoadBalancerCIDRs: config.LoadBalancerCIDRs,
+		ClusterIPCIDRs:    []string{"10.96.0.0/12"},
+		EnableIPv4:        true,
+		EnableIPv6:        false,
+	})
+	if validatorErr == nil {
+		t.Fatal("expected validator to fail with IPv6 disabled, but it succeeded")
 	}
 }

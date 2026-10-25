@@ -1,23 +1,68 @@
 # User Guide
 
-## Try Kube-router with cluster installers
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
-The best way to get started is to deploy Kubernetes with Kube-router is with a cluster installer.
+- [Try kube-router with cluster installers](#try-kube-router-with-cluster-installers)
+  - [kops](#kops)
+  - [kubeadm](#kubeadm)
+  - [k0sproject](#k0sproject)
+  - [k3sproject](#k3sproject)
+  - [generic](#generic)
+  - [Amazon specific notes](#amazon-specific-notes)
+  - [Azure specific notes](#azure-specific-notes)
+- [deployment](#deployment)
+- [command line options](#command-line-options)
+- [requirements](#requirements)
+- [running as daemonset](#running-as-daemonset)
+- [running as agent](#running-as-agent)
+- [cleanup configuration](#cleanup-configuration)
+  - [Docker](#docker)
+  - [containerd](#containerd)
+- [trying kube-router as alternative to kube-proxy](#trying-kube-router-as-alternative-to-kube-proxy)
+- [Binding health check endpoint to a specific host IP](#binding-health-check-endpoint-to-a-specific-host-ip)
+  - [Using the primary host address via Downward API](#using-the-primary-host-address-via-downward-api)
+  - [Using a specific IP address](#using-a-specific-ip-address)
+- [Advertising IPs](#advertising-ips)
+- [External IP and LoadBalancer IP Validation](#external-ip-and-loadbalancer-ip-validation)
+  - [How It Works](#how-it-works)
+  - [Configuration Examples](#configuration-examples)
+  - [Upgrading](#upgrading)
+  - [Shared Flags](#shared-flags)
+- [NetworkPolicy Default-Deny](#networkpolicy-default-deny)
+- [Controlling Service Locality or Traffic Policies](#controlling-service-locality-or-traffic-policies)
+- [Hairpin Mode](#hairpin-mode)
+  - [Hairpin Mode Example](#hairpin-mode-example)
+- [SNATing Service Traffic](#snating-service-traffic)
+- [Load balancing Scheduling Algorithms](#load-balancing-scheduling-algorithms)
+- [CNI Configuration](#cni-configuration)
+  - [CNI Configuration Templates](#cni-configuration-templates)
+  - [HostPort support](#hostport-support)
+- [IPVS Graceful termination support](#ipvs-graceful-termination-support)
+- [MTU](#mtu)
+- [BGP configuration](#bgp-configuration)
+- [Metrics](#metrics)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
+## Try kube-router with cluster installers
+
+The best way to get started is to deploy Kubernetes with kube-router using a cluster installer.
 
 ### kops
 
 Please see the [steps](https://github.com/cloudnativelabs/kube-router/blob/master/docs/kops.md) to deploy Kubernetes
-cluster with Kube-router using [Kops](https://github.com/kubernetes/kops)
+cluster with kube-router using [Kops](https://github.com/kubernetes/kops)
 
 ### kubeadm
 
 Please see the [steps](https://github.com/cloudnativelabs/kube-router/blob/master/docs/kubeadm.md) to deploy Kubernetes
-cluster with Kube-router using [Kubeadm](https://kubernetes.io/docs/setup/independent/create-cluster-kubeadm/)
+cluster with kube-router using [Kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/create-cluster-kubeadm/)
 
 ### k0sproject
 
 k0s by default uses kube-router as a CNI option.
-Please see the [steps](https://docs.k0sproject.io/latest/install/) to deploy Kubernetes cluster with Kube-router using
+Please see the [steps](https://docs.k0sproject.io/latest/install/) to deploy Kubernetes cluster with kube-router using
 [k0s](https://docs.k0sproject.io/)
 
 ### k3sproject
@@ -57,27 +102,34 @@ Depending on what functionality of kube-router you want to use, multiple deploym
 the flags `--run-firewall`, `--run-router`, `--run-service-proxy`, `--run-loadbalancer` to selectively enable only
 required functionality of kube-router.
 
-Also you can choose to run kube-router as agent running on each cluster node. Alternativley you can run kube-router as
+Also you can choose to run kube-router as agent running on each cluster node. Alternatively you can run kube-router as
 pod on each node through daemonset.
 
 ## command line options
 
+<!-- markdownlint-capture -->
+<!-- markdownlint-disable MD013 -->
 ```sh
 Usage of kube-router:
       --advertise-cluster-ip                          Add Cluster IP of the service to the RIB so that it gets advertises to the BGP peers.
       --advertise-external-ip                         Add External IP of service to the RIB so that it gets advertised to the BGP peers.
-      --advertise-loadbalancer-ip                     Add LoadbBalancer IP of service status as set by the LB provider to the RIB so that it gets advertised to the BGP peers.
+      --advertise-loadbalancer-ip                     Add LoadBalancer IP of service status as set by the LB provider to the RIB so that it gets advertised to the BGP peers.
       --advertise-pod-cidr                            Add Node's POD cidr to the RIB so that it gets advertised to the BGP peers. (default true)
       --auto-mtu                                      Auto detect and set the largest possible MTU for kube-bridge and pod interfaces (also accounts for IPIP overlay network when enabled). (default true)
+      --bfd-desired-min-tx-interval uint32            The desired min interval in milliseconds for GoBGP to transmit BFD control packets. (default 1000)
+      --bfd-detection-multiplier uint32               BFD failure detection multiplier. Must be between 1-255. (default 3)
+      --bfd-port uint32                               UDP port for BFD control packets (default 3784)
+      --bfd-required-min-rx-interval uint32           Min interval in milliseconds for GoBGP to receive BFD control packets. (default 1000)
       --bgp-graceful-restart                          Enables the BGP Graceful Restart capability so that routes are preserved on unexpected restarts
       --bgp-graceful-restart-deferral-time duration   BGP Graceful restart deferral time according to RFC4724 4.1, maximum 18h. (default 6m0s)
       --bgp-graceful-restart-time duration            BGP Graceful restart time according to RFC4724 3, maximum 4095s. (default 1m30s)
-      --bgp-holdtime duration                         This parameter is mainly used to modify the holdtime declared to BGP peer. When Kube-router goes down abnormally, the local saving time of BGP route will be affected. Holdtime must be in the range 3s to 18h12m16s. (default 1m30s)
+      --bgp-holdtime duration                         This parameter is mainly used to modify the holdtime declared to BGP peer. When kube-router goes down abnormally, the local saving time of BGP route will be affected. Holdtime must be in the range 3s to 18h12m16s. (default 1m30s)
       --bgp-port uint32                               The port open for incoming BGP connections and to use for connecting with other BGP peers. (default 179)
       --cache-sync-timeout duration                   The timeout for cache synchronization (e.g. '5s', '1m'). Must be greater than 0. (default 1m0s)
       --cleanup-config                                Cleanup iptables rules, ipvs, ipset configuration and exit.
       --cluster-asn uint                              ASN number under which cluster nodes will run iBGP.
       --disable-source-dest-check                     Disable the source-dest-check attribute for AWS EC2 instances. When this option is false, it must be set some other way. (default true)
+      --enable-bfd                                    Enable BFD for GoBGP
       --enable-cni                                    Enable CNI plugin. Disable if you want to use kube-router features alongside another CNI plugin. (default true)
       --enable-ibgp                                   Enables peering with nodes with the same ASN, if disabled will only peer with external BGP peers (default true)
       --enable-ipv4                                   Enables IPv4 support (default true)
@@ -86,25 +138,29 @@ Usage of kube-router:
       --enable-pod-egress                             SNAT traffic from Pods to destinations outside the cluster. (default true)
       --enable-pprof                                  Enables pprof for debugging performance and memory leak issues.
       --excluded-cidrs strings                        Excluded CIDRs are used to exclude IPVS rules from deletion.
+      --gobgp-admin-address string                    Address for GoBGP server. Used in combination with gobgp-admin-port to expose GoBGP for administrative purposes. Setting this to empty string will default the address to 127.0.0.1. (default "127.0.0.1")
+      --gobgp-admin-port uint16                       Port to connect to GoBGP for administrative purposes. Setting this to 0 will disable the GoBGP gRPC server. (default 50051)
       --hairpin-mode                                  Add iptables rules for every Service Endpoint to support hairpin traffic.
+      --health-addr string                            Health check address to listen on (Default: all interfaces; ensure to configure the 'livenessProbe' to use the same IP address)
       --health-port uint16                            Health check port, 0 = Disabled (default 20244)
   -h, --help                                          Print usage information.
       --hostname-override string                      Overrides the NodeName of the node. Set this if kube-router is unable to determine your NodeName automatically.
       --injected-routes-sync-period duration          The delay between route table synchronizations  (e.g. '5s', '1m', '2h22m'). Must be greater than 0. (default 1m0s)
       --iptables-sync-period duration                 The delay between iptables rule synchronizations (e.g. '5s', '1m'). Must be greater than 0. (default 5m0s)
       --ipvs-graceful-period duration                 The graceful period before removing destinations from IPVS services (e.g. '5s', '1m', '2h22m'). Must be greater than 0. (default 30s)
-      --ipvs-graceful-termination                     Enables the experimental IPVS graceful terminaton capability
+      --ipvs-graceful-termination                     Enables the experimental IPVS graceful termination capability
       --ipvs-permit-all                               Enables rule to accept all incoming traffic to service VIP's on the node. (default true)
       --ipvs-sync-period duration                     The delay between ipvs config synchronizations (e.g. '5s', '1m', '2h22m'). Must be greater than 0. (default 5m0s)
       --kubeconfig string                             Path to kubeconfig file with authorization information (the master location is set by the master flag).
       --loadbalancer-default-class                    Handle loadbalancer services without a class (default true)
-      --loadbalancer-ip-range strings                 CIDR values from which loadbalancer services addresses are assigned (can be specified multiple times)
+      --loadbalancer-ip-range strings                 CIDR values from which loadbalancer services addresses are assigned (can be specified multiple times). Also used by the proxy module to validate loadBalancerIPs when --strict-external-ip-validation is enabled.
       --loadbalancer-sync-period duration             The delay between checking for missed services (e.g. '5s', '1m'). Must be greater than 0. (default 1m0s)
       --masquerade-all                                SNAT all traffic to cluster IP/node port.
       --master string                                 The address of the Kubernetes API server (overrides any value in kubeconfig).
       --metrics-addr string                           Prometheus metrics address to listen on, (Default: all interfaces)
       --metrics-path string                           Prometheus metrics path (default "/metrics")
       --metrics-port uint16                           Prometheus metrics port, (Default 0, Disabled)
+      --netpol-default-deny                           Default policy to use for pods to have before NetworkPolicy is applied
       --nodeport-bindon-all-ip                        For service of NodePort type create IPVS service that listens on all IP's of the node.
       --nodes-full-mesh                               Each node in the cluster will setup BGP peering with rest of the nodes. (default true)
       --overlay-encap string                          Valid encapsulation types are "ipip" or "fou" (if set to "fou", the udp port can be specified via "overlay-encap-port") (default "ipip")
@@ -125,23 +181,26 @@ Usage of kube-router:
       --run-service-proxy                             Enables Service Proxy -- sets up IPVS for Kubernetes Services. (default true)
       --runtime-endpoint string                       Path to CRI compatible container runtime socket (used for DSR mode). Currently known working with containerd.
       --service-cluster-ip-range strings              CIDR values from which service cluster IPs are assigned (can be specified up to 2 times) (default [10.96.0.0/12])
-      --service-external-ip-range strings             Specify external IP CIDRs that are used for inter-cluster communication (can be specified multiple times)
+      --service-external-ip-range strings             Specify external IP CIDRs that are used for inter-cluster communication (can be specified multiple times). Also used by the proxy module to validate externalIPs when --strict-external-ip-validation is enabled.
       --service-node-port-range string                NodePort range specified with either a hyphen or colon (default "30000-32767")
       --service-tcp-timeout duration                  Specify TCP timeout for IPVS services in standard duration syntax (e.g. '5s', '1m'), default 0s preserves default system value (default: 0s)
       --service-tcpfin-timeout duration               Specify TCP FIN timeout for IPVS services in standard duration syntax (e.g. '5s', '1m'), default 0s preserves default system value (default: 0s)
       --service-udp-timeout duration                  Specify UDP timeout for IPVS services in standard duration syntax (e.g. '5s', '1m'), default 0s preserves default system value (default: 0s)
+      --strict-external-ip-validation                 When enabled, the proxy module validates externalIPs and loadBalancerIPs against configured CIDR ranges (--service-external-ip-range and --loadbalancer-ip-range). When strict mode is enabled and no range is configured, all externalIPs / loadBalancerIPs are rejected (default-deny). Disable this flag to restore previous behavior of accepting all IPs without validation. (default true)
+      --use-nftables-for-netpol                       [Experimental] Use nftables instead of iptables for the network policy controller. Requires nft >= 1.0.1 and kernel nftables support. (default false)
   -v, --v string                                      log level for V logs (default "0")
   -V, --version                                       Print version information.
 ```
+<!-- markdownlint-restore -->
 
 ## requirements
 
-- Kube-router need to access kubernetes API server to get information on pods, services, endpoints, network policies
+- kube-router needs to access the Kubernetes API server to get information on pods, services, endpoints, network policies
   etc. The very minimum information it requires is the details on where to access the kubernetes API server. This
   information can be passed as:
 
 ```sh
-kube-router --master=http://192.168.1.99:8080/` or `kube-router --kubeconfig=<path to kubeconfig file>
+kube-router --master=http://192.168.1.99:6443/` or `kube-router --kubeconfig=<path to kubeconfig file>
 ```
 
 - If you run kube-router as agent on the node, ipset package must be installed on each of the nodes (when run as
@@ -151,17 +210,14 @@ kube-router --master=http://192.168.1.99:8080/` or `kube-router --kubeconfig=<pa
   configured to allocate pod CIDRs by passing `--allocate-node-cidrs=true` flag and providing a `cluster-cidr` (i.e. by
   passing --cluster-cidr=10.1.0.0/16 for e.g.)
 
-- If you choose to run kube-router as daemonset in Kubernetes version below v1.15, both kube-apiserver and kubelet must
-  be run with `--allow-privileged=true` option. In later Kubernetes versions, only kube-apiserver must be run with
-  `--allow-privileged=true` option and if PodSecurityPolicy admission controller is enabled, you should create
-  PodSecurityPolicy, allowing privileged kube-router pods.
-  - Additionally, when run in daemonset mode, it is highly recommended that you keep netfilter related userspace host
+- If you choose to run kube-router as a daemonset, the kube-router pods require privileged access.
+  - When run in daemonset mode, it is highly recommended that you keep netfilter related userspace host
     tooling like `iptables`, `ipset`, and `ipvsadm` in sync with the versions that are distributed by Alpine inside the
     kube-router container. This will help avoid conflicts that can potentially arise when both the host's userspace and
     kube-router's userspace tooling modifies netfilter kernel definitions. See:
     [this kube-router issue](https://github.com/cloudnativelabs/kube-router/issues/1370) for more information.
 
-- If you choose to use kube-router for pod-to-pod network connecitvity then Kubernetes cluster must be configured to use
+- If you choose to use kube-router for pod-to-pod network connectivity then Kubernetes cluster must be configured to use
   CNI network plugins. On each node CNI conf file is expected to be present as /etc/cni/net.d/10-kuberouter.conf
   `bridge` CNI plugin and `host-local` for IPAM should be used. A sample conf file that can be downloaded as
 
@@ -181,7 +237,7 @@ wget -O /etc/cni/net.d/10-kuberouter.conf https://raw.githubusercontent.com/clou
 
 ## running as daemonset
 
-This is quickest way to deploy kube-router in Kubernetes (**dont forget to ensure the requirements above**).
+This is quickest way to deploy kube-router in Kubernetes (**don't forget to ensure the requirements above**).
 Just run:
 
 ```sh
@@ -195,11 +251,11 @@ arguments used to select a set of the services kube-router should run.
 
 ## running as agent
 
-You can choose to run kube-router as agent runnng on each node. For e.g if you just want kube-router to provide ingress
+You can choose to run kube-router as an agent running on each node. For e.g if you just want kube-router to provide ingress
 firewall for the pods then you can start kube-router as:
 
 ```sh
-kube-router --master=http://192.168.1.99:8080/ --run-firewall=true --run-service-proxy=false --run-router=false
+kube-router --master=http://192.168.1.99:6443/ --run-firewall=true --run-service-proxy=false --run-router=false
 ```
 
 ## cleanup configuration
@@ -231,13 +287,13 @@ docker.io/cloudnativelabs/kube-router:latest kube-router-cleanup /usr/local/bin/
 If you have a kube-proxy in use, and want to try kube-router just for service proxy you can do
 
 ```sh
-kube-proxy --cleanup-iptables
+kube-proxy --cleanup
 ```
 
 followed by
 
 ```sh
-kube-router --master=http://192.168.1.99:8080/ --run-service-proxy=true --run-firewall=false --run-router=false
+kube-router --master=http://192.168.1.99:6443/ --run-service-proxy=true --run-firewall=false --run-router=false
 ```
 
 and if you want to move back to kube-proxy then clean up config done by kube-router by running
@@ -247,6 +303,62 @@ and if you want to move back to kube-proxy then clean up config done by kube-rou
 ```
 
 and run kube-proxy with the configuration you have.
+
+## Binding health check endpoint to a specific host IP
+
+Using `--health-addr` you can bind health check to specific host IP.
+When using this option, you have to ensure, that the `livenessProbe` is configured to use the same IP address.
+
+### Using the primary host address via Downward API
+
+You can use the Kubernetes [Downward API](https://kubernetes.io/docs/concepts/workloads/pods/downward-api/) to determine
+the primary IP address of the node to which the Pod is assigned and use it for the health check.
+
+```yaml
+env:
+  - name: HOST_IP
+    valueFrom:
+      fieldRef:
+        fieldPath: status.hostIP
+args:
+  - --health-addr=$(HOST_IP)
+```
+
+Ensure to configure the `livenessProbe` to use the `HOST_IP` as the `host` value.
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 20244
+    host: $(HOST_IP)
+    scheme: HTTP
+  initialDelaySeconds: 10
+  periodSeconds: 10
+```
+
+### Using a specific IP address
+
+You can also use a specific IP address for the health check. For example 127.0.0.1 to bind locally, or any other
+available IP address.
+
+```yaml
+args:
+  - --health-addr=127.0.0.1
+```
+
+You still need to configure the `livenessProbe` to use the chosen IP address for the `host` value.
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 20244
+    host: 127.0.0.1
+    scheme: HTTP
+  initialDelaySeconds: 10
+  periodSeconds: 10
+```
 
 ## Advertising IPs
 
@@ -278,7 +390,98 @@ Advertising LoadBalancer IPs works by inspecting the services `status.loadBalanc
 LoadBalancers like for example MetalLb. This has been successfully tested together with
 [MetalLB](https://github.com/google/metallb) in ARP mode.
 
-## Controlling Service Locality / Traffic Policies
+**Note:** When `--strict-external-ip-validation` is enabled (the default), externalIPs and loadBalancerIPs must pass
+validation against configured CIDR ranges before they are programmed into IPVS. IPs that are rejected by the proxy
+module will not be advertised. See [External IP and LoadBalancer IP Validation](#external-ip-and-loadbalancer-ip-validation)
+for details.
+
+## External IP and LoadBalancer IP Validation
+
+Starting with v2.8.0, the service proxy (Network Services Controller) validates `externalIPs` and
+`loadBalancerIPs` before programming them into IPVS. This is controlled by the `--strict-external-ip-validation` flag,
+which defaults to `true`.
+
+**This is a breaking change.** Previously, all externalIPs and loadBalancerIPs were accepted unconditionally. Now they
+are validated against configured CIDR ranges.
+
+### How It Works
+
+When `--strict-external-ip-validation=true` (the default):
+
+- **externalIPs** are validated against `--service-external-ip-range` CIDRs
+- **loadBalancerIPs** are validated against `--loadbalancer-ip-range` CIDRs
+- **ClusterIP conflict detection**: externalIPs that fall within `--service-cluster-ip-range` are always rejected to
+  prevent denial-of-service against cluster services
+- **Default-deny**: if no range is configured for a given IP type, **all** IPs of that type are rejected
+
+When `--strict-external-ip-validation=false`:
+
+- All externalIPs and loadBalancerIPs are accepted without validation (previous behavior)
+
+### Configuration Examples
+
+Allow specific externalIP and loadBalancerIP ranges:
+
+```sh
+kube-router \
+  --run-service-proxy=true \
+  --service-external-ip-range=198.51.100.0/24 \
+  --service-external-ip-range=203.0.113.0/24 \
+  --loadbalancer-ip-range=10.255.0.0/16
+```
+
+Disable validation to restore previous behavior:
+
+```sh
+kube-router \
+  --run-service-proxy=true \
+  --strict-external-ip-validation=false
+```
+
+### Upgrading
+
+If you are upgrading from a version without this feature and you use externalIPs or LoadBalancer services, you must
+either:
+
+1. **Configure the appropriate CIDR ranges** before upgrading by adding `--service-external-ip-range` and/or
+   `--loadbalancer-ip-range` flags to your kube-router arguments
+2. **Disable strict validation** by adding `--strict-external-ip-validation=false` to your kube-router arguments
+
+If you do neither, all externalIPs and loadBalancerIPs will be rejected after the upgrade (default-deny behavior).
+
+See [Upgrading kube-router](upgrading.md) for more details.
+
+### Shared Flags
+
+The `--service-external-ip-range` and `--loadbalancer-ip-range` flags serve multiple purposes:
+
+- `--service-external-ip-range` is used by the **network policy controller** for firewall rules and by the
+  **proxy module** for externalIP validation
+- `--loadbalancer-ip-range` is used by the **load balancer allocator** for IPAM and by the **proxy module** for
+  loadBalancerIP validation
+
+If you were already using these flags for other controllers, the proxy module will automatically benefit from the same
+configuration.
+
+## NetworkPolicy Default-Deny
+
+When `--netpol-default-deny` is enabled, kube-router rejects traffic to and from local pods during the brief window
+between a pod becoming routable on this node and its per-pod `KUBE-POD-FW-*` firewall chain being installed. Without
+this flag, a freshly-launched pod can briefly reach destinations that its NetworkPolicy would otherwise block — a
+race short-lived workloads such as CronJobs occasionally lose.
+
+To detect this node's pod CIDRs, kube-router relies on either the `--allocate-node-cidrs=true` flag on
+kube-controller-manager (the typical Kubernetes default) or the `kube-router.io/pod-cidrs` node annotation. If neither
+is configured the controller logs an error during startup, disables `--netpol-default-deny`, and continues without
+default-deny protection — it is not safe to install REJECTs against pod CIDRs we cannot trust.
+
+For details on how to verify the feature is doing what you expect (and on the failure modes when the node's pod
+CIDRs cannot be detected), see [NetworkPolicy not enforced on freshly-launched pods][netpol-default-deny] in the
+troubleshooting guide.
+
+[netpol-default-deny]: troubleshoot.md#networkpolicy-not-enforced-on-freshly-launched-pods
+
+## Controlling Service Locality or Traffic Policies
 
 Service availability both externally and locally (within the cluster) can be controlled via the Kubernetes standard
 [Traffic Policies](https://kubernetes.io/docs/reference/networking/virtual-ips/#traffic-policies) and via the custom
@@ -341,7 +544,7 @@ if it needs to proxy that traffic to ensure it gets to a node that has a service
 traffic. This has a potential to cause issues when network policies are applied to that service since now the traffic
 will appear to be coming from a node in your cluster instead of the traffic originator.
 
-This is an issue that is common to all proxy's and all Kubernetes service proxies in general. You can read more
+This is an issue that is common to all proxies and all Kubernetes service proxies in general. You can read more
 information about this issue at:
 [Source IP for Services](https://kubernetes.io/docs/tutorials/services/source-ip/#source-ip-for-services-with-type-nodeport)
 
@@ -351,10 +554,10 @@ information see the section above.
 
 ## Load balancing Scheduling Algorithms
 
-Kube-router uses LVS for service proxy. LVS supports a rich set of [scheduling
+kube-router uses LVS for service proxy. LVS supports a rich set of [scheduling
 algorithms](https://en.wikipedia.org/wiki/Linux_Virtual_Server#Schedulers). The
 scheduling algorithm for a service is configured by means of annotations. The
-`round-robin` scheduler is used by default when a service is lacks the
+`round-robin` scheduler is used by default when a service lacks the
 scheduler annotation.
 
 ```sh
@@ -382,54 +585,100 @@ $ kubectl annotate service my-service "kube-router.io/service.schedflags=flag-2"
 $ kubectl annotate service my-service "kube-router.io/service.schedflags=flag-1,flag-2"
 ```
 
-## HostPort support
+## CNI Configuration
 
-If you would like to use `HostPort` functionality below changes are required in the manifest.
+kube-router provides pod networking by means of the standard [`bridge`][cni-bridge] and [`host-local`][cni-host-local]
+[containernetworking plugins], optionally accompanied by others like [`portmap`][cni-portmap]. The kube-router Docker
+image ships these plugins, and the [example daemonsets](../daemonset/) install them onto the node in an init container.
+kube-router's own contribution is the routing of pod traffic between nodes and the management of the plugins'
+configuration file, filling in the parts that are node-specific and only known at runtime. The latter is what
+`--enable-cni` controls, which is enabled by default. Disable it to use kube-router's features alongside another CNI
+provider.
 
-- By default kube-router assumes CNI conf file to be `/etc/cni/net.d/10-kuberouter.conf`. Add an environment variable
-`KUBE_ROUTER_CNI_CONF_FILE` to kube-router manifest and set it to `/etc/cni/net.d/10-kuberouter.conflist`
+During startup, kube-router inserts the pod CIDRs of the node into the `host-local` IPAM ranges of the `bridge` plugin
+as allocated by kube-controller-manager or via the `kube-router.io/pod-cidrs` annotation. If the `--auto-mtu` flag is
+enabled, kube-router also sets the `bridge` plugin's [MTU](#mtu).
 
-- Modify `kube-router-cfg` ConfigMap with CNI config that supports `portmap` as additional plug-in
+The completed configuration is written back once the `kube-bridge` interface has been set up. The configuration is read
+from and written to `/etc/cni/net.d/10-kuberouter.conf` by default; the location can be changed via the
+`KUBE_ROUTER_CNI_CONF_FILE` environment variable. A file name ending in `.conflist` is treated as a [configuration
+list][cni-config-format], i.e. a chain of multiple plugins, any other name as a single plugin configuration.
 
-```json
-    {
-       "cniVersion":"0.3.0",
-       "name":"mynet",
-       "plugins":[
-          {
-             "name":"kubernetes",
-             "type":"bridge",
-             "bridge":"kube-bridge",
-             "isDefaultGateway":true,
-             "ipam":{
-                "type":"host-local"
-             }
-          },
-          {
-             "type":"portmap",
-             "capabilities":{
-                "snat":true,
-                "portMappings":true
-             }
-          }
-       ]
-    }
-```
+The configuration file must exist when kube-router starts. The [example daemonsets](../daemonset/) ship it in a
+`kube-router-cfg` ConfigMap and use an init container to copy it into the CNI configuration directory.
 
-- Update init container command to create `/etc/cni/net.d/10-kuberouter.conflist` file
+### CNI Configuration Templates
+
+A configuration file that's copied into the CNI configuration directory by an init container is already visible to the
+container runtime before kube-router has completed it, so on a freshly booted node, pod sandbox creation may transiently
+fail with errors like "no IP ranges specified" until kube-router has filled in the missing parts.
+
+To avoid this, the `KUBE_ROUTER_CNI_CONF_TEMPLATE_FILE` environment variable can point kube-router to a potentially
+incomplete CNI configuration outside of the CNI configuration directory, e.g. a ConfigMap mounted at
+`/etc/kube-router/cni-conf.json`. kube-router will then read the configuration from the template instead, and write the
+completed configuration to `KUBE_ROUTER_CNI_CONF_FILE`, which doesn't need to exist beforehand. The template is
+interpreted according to the file name given in `KUBE_ROUTER_CNI_CONF_FILE`, i.e. as a configuration list if that name
+ends in `.conflist`. The template's own file name has no significance. As a result, the container runtime won't pick up
+an incomplete configuration and try to set up pod networking too early. Since the configuration is re-derived from the
+pristine template on every start, the written configuration is wholly owned by kube-router.
+
+For an example manifest, please look at the [CNI configuration template manifest].
+
+### HostPort support
+
+If you would like to use `HostPort` functionality, the following changes are required in the manifest:
+
+- Since the `portmap` plugin needs to be chained after the `bridge` plugin, the CNI configuration has to be a config
+  list: set `KUBE_ROUTER_CNI_CONF_FILE` to `/etc/cni/net.d/10-kuberouter.conflist` (see above)
+- Modify the `kube-router-cfg` ConfigMap with a CNI configuration that supports `portmap` as an additional plug-in:
+
+  ```json
+      {
+         "cniVersion":"1.0.0",
+         "name":"mynet",
+         "plugins":[
+            {
+               "name":"kubernetes",
+               "type":"bridge",
+               "bridge":"kube-bridge",
+               "isDefaultGateway":true,
+               "ipam":{
+                  "type":"host-local"
+               }
+            },
+            {
+               "type":"portmap",
+               "capabilities":{
+                  "snat":true,
+                  "portMappings":true
+               }
+            }
+         ]
+      }
+  ```
+
+- Update the init container command to create `/etc/cni/net.d/10-kuberouter.conflist`, or point
+  `KUBE_ROUTER_CNI_CONF_TEMPLATE_FILE` at the ConfigMap mount instead
 - Restart the container runtime
 
 For an e.g manifest please look at [manifest](../daemonset/kubeadm-kuberouter-all-features-hostport.yaml) with necessary
 changes required for `HostPort` functionality.
 
+[cni-bridge]: https://www.cni.dev/plugins/v1.1/main/bridge/
+[cni-host-local]: https://www.cni.dev/plugins/v1.1/ipam/host-local/
+[containernetworking plugins]: https://github.com/containernetworking/plugins
+[cni-portmap]: https://www.cni.dev/plugins/v1.1/meta/portmap/
+[cni-config-format]: https://www.cni.dev/docs/spec/#configuration-format
+[CNI configuration template manifest]: ../daemonset/generic-kuberouter-cni-conf-template.yaml
+
 ## IPVS Graceful termination support
 
-As of 0.2.6 we support experimental graceful termination of IPVS destinations. When possible the pods's
-TerminationGracePeriodSeconds is used, if it cannot be retrived for some reason the fallback period is 30 seconds and
-can be adjusted with `--ipvs-graceful-period` cli-opt
+We support experimental graceful termination of IPVS destinations. When possible, the pod's
+`TerminationGracePeriodSeconds` is used. If it cannot be retrieved for some reason, the fallback period of 30 seconds
+and can be adjusted with `--ipvs-graceful-period` cli-opt
 
 graceful termination works in such a way that when kube-router receives a delete endpoint notification for a service
-it's weight is adjusted to 0 before getting deleted after he termination grace period has passed or the Active &
+its weight is adjusted to 0 before getting deleted after the termination grace period has passed or the Active &
 Inactive connections goes down to 0.
 
 ## MTU
@@ -444,7 +693,7 @@ attempt to configure MTU. However you can choose the right MTU and set in the `c
 ```json
   cni-conf.json: |
     {
-       "cniVersion":"0.3.0",
+       "cniVersion":"1.0.0",
        "name":"mynet",
        "plugins":[
           {

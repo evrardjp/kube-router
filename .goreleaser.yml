@@ -1,4 +1,5 @@
 ---
+version: 2
 release:
   draft: true
   prerelease: auto
@@ -26,8 +27,8 @@ builds:
     env:
       - CGO_ENABLED=0
     ldflags:
-      - "-X github.com/cloudnativelabs/kube-router/pkg/version.Version={{.Version}}"
-      - "-X github.com/cloudnativelabs/kube-router/pkg/version.BuildDate={{.Date}}"
+      - "-X github.com/cloudnativelabs/kube-router/v2/pkg/version.Version={{.Version}}"
+      - "-X github.com/cloudnativelabs/kube-router/v2/pkg/version.BuildDate={{.Date}}"
 
 archives:
   - format: tar.gz
@@ -39,5 +40,10 @@ archives:
       - CHANGELOG*
       - Documentation*
 
+# Pin the checksum filename to a stable, version-independent name so that the
+# SLSA provenance step in .github/workflows/ci-release.yml can reference it
+checksum:
+  name_template: 'checksums.txt'
+
 snapshot:
-  name_template: SNAPSHOT-{{ .Commit }}
+  version_template: SNAPSHOT-{{ .Commit }}

@@ -1,0 +1,378 @@
+package bgp
+
+import (
+	"net"
+	"testing"
+
+	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
+	"github.com/goccy/go-yaml"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestPeerConfig_String(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		config   PeerConfig
+		expected string
+	}{
+		{
+			name: "LocalIP",
+			config: PeerConfig{
+				localIP: "192.168.1.1",
+			},
+			expected: "PeerConfig{LocalIP: 192.168.1.1}",
+		},
+		{
+			name: "Port",
+			config: PeerConfig{
+				port: new(uint32(179)),
+			},
+			expected: "PeerConfig{Port: 179}",
+		},
+		{
+			name: "RemoteASN",
+			config: PeerConfig{
+				remoteASN: uint32(65000),
+			},
+			expected: "PeerConfig{RemoteASN: 65000}",
+		},
+		{
+			name: "RemoteIP",
+			config: PeerConfig{
+				remoteIP: net.ParseIP("10.0.0.1"),
+			},
+			expected: "PeerConfig{RemoteIP: 10.0.0.1}",
+		},
+		{
+			name: "RemoteIP with IPv6",
+			config: PeerConfig{
+				remoteIP: net.ParseIP("2001:db8::1"),
+			},
+			expected: "PeerConfig{RemoteIP: 2001:db8::1}",
+		},
+		{
+			name: "Password should not be printed",
+			config: PeerConfig{
+				password: utils.Base64String("password"),
+			},
+			expected: "PeerConfig{}",
+		},
+		{
+			name: "All fields - password should not be printed",
+			config: PeerConfig{
+				localIP:   "192.168.1.1",
+				password:  utils.Base64String("password"),
+				port:      new(uint32(179)),
+				remoteASN: uint32(65000),
+				remoteIP:  net.ParseIP("10.0.0.1"),
+			},
+			expected: "PeerConfig{LocalIP: 192.168.1.1, Port: 179, RemoteASN: 65000, RemoteIP: 10.0.0.1}",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(st *testing.T) {
+			result := tt.config.String()
+			assert.Equal(st, tt.expected, result)
+		})
+	}
+}
+
+func TestPeerConfig_UnmarshalYAML(t *testing.T) {
+	tests := []struct {
+		name          string
+		input         []byte
+		expected      PeerConfig
+		errorContains string
+	}{
+		{
+			name: "Valid peer config YAML",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+password: aGVsbG8=
+`),
+			expected: PeerConfig{
+				password:  utils.Base64String("hello"),
+				remoteIP:  net.ParseIP("1.1.1.1"),
+				remoteASN: uint32(1234),
+			},
+		},
+		{
+			name: "Valid peer config YAML with BFD enabled",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+password: aGVsbG8=
+bfd:
+  enabled: true
+  desired_min_tx_interval: 1000
+  required_min_rx_interval: 1000
+`),
+			expected: PeerConfig{
+				password:  utils.Base64String("hello"),
+				remoteIP:  net.ParseIP("1.1.1.1"),
+				remoteASN: uint32(1234),
+				bfd: BFDConfig{
+					Enabled:               true,
+					DesiredMinTxInterval:  new(uint32(1000)),
+					RequiredMinRxInterval: new(uint32(1000)),
+				},
+			},
+		},
+		{
+			name:     "empty YAML",
+			expected: PeerConfig{},
+		},
+		{
+			name:          "Remote IP must be set",
+			input:         []byte(`remoteasn: 1234`),
+			errorContains: "remoteip cannot be empty",
+		},
+		{
+			name:          "Remote ASN must be set",
+			input:         []byte(`remoteip: 1.1.1.1`),
+			errorContains: "remoteasn cannot be empty",
+		},
+		{
+			name: "Invalid ASN",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 0`),
+			errorContains: "reserved ASN number",
+		},
+		{
+			name: "Invalid remote IPv4",
+			input: []byte(`remoteip: 1234.12
+remoteasn: 1234`),
+			errorContains: "is not a valid IP address",
+		},
+		{
+			name: "Invalid remote IPv6",
+			input: []byte(`remoteip: 2001::db8::abcd
+remoteasn: 1234`),
+			errorContains: "is not a valid IP address",
+		},
+		{
+			name: "Invalid BFD port ",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+bfd:
+  enabled: true
+  port: 0`),
+			errorContains: "bfd port must be between",
+		},
+		{
+			name: "Invalid BFD detection multiplier",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+bfd:
+  enabled: true
+  detection_multiplier: 0`),
+			errorContains: "bfd detection multiplier must be between",
+		},
+		{
+			name: "Invalid BFD desired min tx interval",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+bfd:
+  enabled: true
+  desired_min_tx_interval: 0`),
+			errorContains: "bfd desired min tx interval must be between",
+		},
+		{
+			name: "Invalid BFD required min rx interval",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: 1234
+bfd:
+  enabled: true
+  required_min_rx_interval: 0`),
+			errorContains: "bfd required min rx interval must be between",
+		},
+		{
+			name: "Invalid field type does not leak password",
+			input: []byte(`remoteip: 1.1.1.1
+remoteasn: notanumber
+password: aGVsbG8=`),
+			errorContains: "failed to unmarshal peer config",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(st *testing.T) {
+			var actual PeerConfig
+			err := yaml.Unmarshal(tt.input, &actual)
+			if tt.errorContains != "" {
+				assert.ErrorContains(st, err, tt.errorContains)
+				assert.NotContains(st, err.Error(), "aGVsbG8=")
+			} else {
+				assert.NoError(st, err)
+				assert.Equal(st, tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestPeerConfigs_String(t *testing.T) {
+	tests := []struct {
+		name     string
+		configs  PeerConfigs
+		expected string
+	}{
+		{
+			name:     "empty PeerConfigs",
+			configs:  PeerConfigs{},
+			expected: "PeerConfigs[]",
+		},
+		{
+			name: "PeerConfig - password should not be printed",
+			configs: PeerConfigs{
+				{
+					localIP:   "192.168.1.1",
+					password:  utils.Base64String("secret"),
+					port:      new(uint32(179)),
+					remoteASN: uint32(65000),
+					remoteIP:  net.ParseIP("10.0.0.1"),
+				},
+			},
+			expected: "PeerConfigs[PeerConfig{LocalIP: 192.168.1.1, Port: 179, RemoteASN: 65000, RemoteIP: 10.0.0.1}]",
+		},
+		{
+			name: "multiple PeerConfigs - passwords should not be printed",
+			configs: PeerConfigs{
+				{
+					localIP:   "192.168.1.1",
+					password:  utils.Base64String("secret"),
+					remoteASN: uint32(65000),
+					remoteIP:  net.ParseIP("10.0.0.1"),
+				},
+				{
+					port:      new(uint32(179)),
+					remoteASN: uint32(65001),
+					remoteIP:  net.ParseIP("10.0.0.2"),
+				},
+				{
+					remoteIP: net.ParseIP("10.0.0.3"),
+				},
+			},
+			expected: "PeerConfigs[PeerConfig{LocalIP: 192.168.1.1, RemoteASN: 65000, RemoteIP: 10.0.0.1},PeerConfig{Port: 179, RemoteASN: 65001, RemoteIP: 10.0.0.2},PeerConfig{RemoteIP: 10.0.0.3}]",
+		},
+		{
+			name: "PeerConfigs - with BFD config",
+			configs: PeerConfigs{
+				{
+					localIP:   "192.168.1.1",
+					password:  utils.Base64String("secret"),
+					remoteASN: uint32(65000),
+					remoteIP:  net.ParseIP("10.0.0.1"),
+					bfd: BFDConfig{
+						Enabled: true,
+						Port:    new(uint32(13784)),
+					},
+				},
+				{
+					port:      new(uint32(179)),
+					remoteASN: uint32(65001),
+					remoteIP:  net.ParseIP("10.0.0.2"),
+				},
+				{
+					remoteIP: net.ParseIP("10.0.0.3"),
+				},
+			},
+			expected: "PeerConfigs[PeerConfig{LocalIP: 192.168.1.1, RemoteASN: 65000, RemoteIP: 10.0.0.1, BFD: BFDConfig{Enabled: true, Port: 13784}},PeerConfig{Port: 179, RemoteASN: 65001, RemoteIP: 10.0.0.2},PeerConfig{RemoteIP: 10.0.0.3}]",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(st *testing.T) {
+			assert.Equal(st, tt.expected, tt.configs.String())
+		})
+	}
+}
+
+func Test_NewPeerConfigs(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name                string
+		remoteIPs           []string
+		remoteASNs          []uint32
+		ports               []uint32
+		b64EncodedPasswords []string
+		localIPs            []string
+		localAddress        string
+		bfdConfig           BFDConfig
+		errorContains       string
+	}{
+		{
+			name: "all fields set to nil returns nothing",
+		},
+		{
+			name:          "number of remote IPs and remote ASNs don't match returns error",
+			remoteIPs:     []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs:    []uint32{1234},
+			errorContains: "the number of IPs and ASN numbers must be equal",
+		},
+		{
+			name:                "number of remote IPs and passwords don't match returns error",
+			remoteIPs:           []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs:          []uint32{1234, 2345},
+			b64EncodedPasswords: []string{"fakepassword"},
+			errorContains:       "number of passwords",
+		},
+		{
+			name:          "number of remote IPs and ports don't match returns error",
+			remoteIPs:     []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs:    []uint32{1234, 2345},
+			ports:         []uint32{8080},
+			errorContains: "number of ports",
+		},
+		{
+			name:          "number of remote IPs and local IPs don't match returns error",
+			remoteIPs:     []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs:    []uint32{1234, 2345},
+			localIPs:      []string{"1.1.1.1"},
+			errorContains: "number of localIPs",
+		},
+		{
+			name:          "remoteASN contains a reserved ASN number returns error",
+			remoteIPs:     []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs:    []uint32{0, 2345},
+			errorContains: "reserved ASN",
+		},
+		{
+			name:       "BFD config is propagated to all peers",
+			remoteIPs:  []string{"10.0.0.1", "10.0.0.2"},
+			remoteASNs: []uint32{1234, 2345},
+			bfdConfig: BFDConfig{
+				Enabled:               true,
+				Port:                  new(uint32(37850)),
+				DetectionMultiplier:   new(uint32(3)),
+				DesiredMinTxInterval:  new(uint32(100)),
+				RequiredMinRxInterval: new(uint32(100)),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			peerCfgs, err := NewPeerConfigs(tt.remoteIPs, tt.remoteASNs, tt.ports, tt.b64EncodedPasswords, tt.localIPs, tt.localAddress, tt.bfdConfig)
+			if tt.errorContains != "" {
+				assert.ErrorContains(t, err, tt.errorContains)
+			} else {
+				assert.NoError(t, err)
+				if len(peerCfgs) > 0 && tt.bfdConfig.Enabled {
+					for i, pc := range peerCfgs {
+						if !pc.BFD().Enabled {
+							t.Errorf("peer %d should have BFD enabled", i)
+						}
+						if pc.BFD().Port == nil || *pc.BFD().Port != *tt.bfdConfig.Port {
+							t.Errorf("peer %d BFD port mismatch: expected %d, got %v", i, *tt.bfdConfig.Port, pc.BFD().Port)
+						}
+						if pc.BFD().DetectionMultiplier == nil || *pc.BFD().DetectionMultiplier != *tt.bfdConfig.DetectionMultiplier {
+							t.Errorf("peer %d BFD detection multiplier mismatch", i)
+						}
+					}
+				}
+			}
+		})
+	}
+}

@@ -1,7 +1,7 @@
 package main
 
 import (
-	"flag"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -26,25 +26,19 @@ func main() {
 }
 
 func Main() error {
-	klog.InitFlags(nil)
-
 	config := options.NewKubeRouterConfig()
 	config.AddFlags(pflag.CommandLine)
 	pflag.Parse()
 
-	// Workaround for this issue:
-	// https://github.com/kubernetes/kubernetes/issues/17162
-	err := flag.CommandLine.Parse([]string{})
-	if err != nil {
-		return fmt.Errorf("failed to parse flags: %s", err)
+	// Level.Set() mutates klog's package-global verbosity rather than the receiver, so we can discard
+	// vLevel afterwards. Everything else we need, logging to stderr included, is already klog's default.
+	var vLevel klog.Level
+	if err := vLevel.Set(config.VLevel); err != nil {
+		return fmt.Errorf("failed to set log level to %q: %w", config.VLevel, err)
 	}
-	err = flag.Set("logtostderr", "true")
-	if err != nil {
-		return fmt.Errorf("failed to set flag: %s", err)
-	}
-	err = flag.Set("v", config.VLevel)
-	if err != nil {
-		return fmt.Errorf("failed to set flag: %s", err)
+
+	if args := pflag.Args(); len(args) > 0 {
+		return fmt.Errorf("unrecognized positional argument(s): %v", args)
 	}
 
 	if config.HelpRequested {
@@ -58,17 +52,17 @@ func Main() error {
 	}
 
 	if os.Geteuid() != 0 {
-		return fmt.Errorf("kube-router needs to be run with privileges to execute iptables, ipset and configure ipvs")
+		return errors.New("kube-router needs to be run with privileges to execute iptables, ipset and configure ipvs")
 	}
 
 	if config.CleanupConfig {
-		cmd.CleanupConfigAndExit()
+		cmd.CleanupConfigAndExit(config)
 		return nil
 	}
 
 	kubeRouter, err := cmd.NewKubeRouterDefault(config)
 	if err != nil {
-		return fmt.Errorf("failed to parse kube-router config: %v", err)
+		return fmt.Errorf("failed to parse kube-router config: %w", err)
 	}
 
 	if config.EnablePprof {
@@ -84,7 +78,7 @@ func Main() error {
 
 	err = kubeRouter.Run()
 	if err != nil {
-		return fmt.Errorf("failed to run kube-router: %v", err)
+		return fmt.Errorf("failed to run kube-router: %w", err)
 	}
 
 	return nil
